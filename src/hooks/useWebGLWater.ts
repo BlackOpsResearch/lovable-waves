@@ -9,24 +9,10 @@ import {
   Raytracer
 } from '@/lib/webgl';
 import { createTileTexture, createSkyboxTextures } from '@/lib/webgl/TextureGenerators';
-import { WaterSettings, DEFAULT_WATER_SETTINGS } from '@/lib/webgl/Water';
-import { RenderSettings, DEFAULT_RENDER_SETTINGS, SphereData } from '@/lib/webgl/Renderer';
 
 const MODE_ADD_DROPS = 0;
 const MODE_MOVE_SPHERE = 1;
 const MODE_ORBIT_CAMERA = 2;
-
-export interface WaterControlSettings {
-  water: WaterSettings;
-  render: RenderSettings;
-}
-
-// Default sphere configurations
-const DEFAULT_SPHERES: Array<{ center: Vector; radius: number; color: [number, number, number] }> = [
-  { center: new Vector(-0.4, -0.75, 0.2), radius: 0.25, color: [0.6, 0.6, 0.6] },
-  { center: new Vector(0.4, -0.6, -0.3), radius: 0.18, color: [0.9, 0.3, 0.2] },
-  { center: new Vector(0.1, -0.5, 0.5), radius: 0.15, color: [0.2, 0.5, 0.9] },
-];
 
 export function useWebGLWater(canvasRef: React.RefObject<HTMLCanvasElement | null>) {
   const glRef = useRef<GLContextExtended | null>(null);
@@ -37,20 +23,18 @@ export function useWebGLWater(canvasRef: React.RefObject<HTMLCanvasElement | nul
   
   const [isInitialized, setIsInitialized] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [settings, setSettings] = useState<WaterControlSettings>({
-    water: { ...DEFAULT_WATER_SETTINGS },
-    render: { ...DEFAULT_RENDER_SETTINGS }
-  });
   
   // Camera state
   const angleXRef = useRef(-25);
   const angleYRef = useRef(-200.5);
   
   // Sphere physics
+  const centerRef = useRef(new Vector(-0.4, -0.75, 0.2));
+  const oldCenterRef = useRef(new Vector(-0.4, -0.75, 0.2));
+  const velocityRef = useRef(new Vector());
   const gravityRef = useRef(new Vector(0, -4, 0));
+  const radiusRef = useRef(0.25);
   const useSpherePhysicsRef = useRef(false);
-  const selectedSphereRef = useRef(-1);
-  const lastInteractionRef = useRef(new Vector(0, 0, 0));
   
   // Interaction state
   const modeRef = useRef(-1);
@@ -58,7 +42,6 @@ export function useWebGLWater(canvasRef: React.RefObject<HTMLCanvasElement | nul
   const planeNormalRef = useRef<Vector | null>(null);
   const oldPosRef = useRef({ x: 0, y: 0 });
   const pausedRef = useRef(false);
-  const timeRef = useRef(0);
   
   const draw = useCallback(() => {
     const gl = glRef.current;
@@ -76,9 +59,11 @@ export function useWebGLWater(canvasRef: React.RefObject<HTMLCanvasElement | nul
     gl.translate(0, 0.5, 0);
     
     gl.enable(gl.DEPTH_TEST);
+    renderer.sphereCenter = centerRef.current;
+    renderer.sphereRadius = radiusRef.current;
     renderer.renderCube(water);
     renderer.renderWater(water, cubemap);
-    renderer.renderSpheres(water);
+    renderer.renderSphere(water);
     gl.disable(gl.DEPTH_TEST);
   }, []);
   
@@ -89,42 +74,26 @@ export function useWebGLWater(canvasRef: React.RefObject<HTMLCanvasElement | nul
     
     if (seconds > 1) return;
     
-    timeRef.current += seconds;
-    
-    // Update sphere physics
     if (modeRef.current === MODE_MOVE_SPHERE) {
-      // Stop velocity when dragging
-      if (selectedSphereRef.current >= 0 && selectedSphereRef.current < renderer.spheres.length) {
-        renderer.spheres[selectedSphereRef.current].velocity = new Vector();
-      }
+      velocityRef.current = new Vector();
     } else if (useSpherePhysicsRef.current) {
-      for (const sphere of renderer.spheres) {
-        const percentUnderWater = Math.max(0, Math.min(1, (sphere.radius - sphere.center.y) / (2 * sphere.radius)));
-        sphere.velocity = sphere.velocity.add(
-          gravityRef.current.multiply(seconds - 1.1 * seconds * percentUnderWater)
-        );
-        sphere.velocity = sphere.velocity.subtract(
-          sphere.velocity.unit().multiply(percentUnderWater * seconds * sphere.velocity.dot(sphere.velocity))
-        );
-        sphere.center = sphere.center.add(sphere.velocity.multiply(seconds));
-        
-        if (sphere.center.y < sphere.radius - 1) {
-          sphere.center.y = sphere.radius - 1;
-          sphere.velocity.y = Math.abs(sphere.velocity.y) * 0.7;
-        }
+      const percentUnderWater = Math.max(0, Math.min(1, (radiusRef.current - centerRef.current.y) / (2 * radiusRef.current)));
+      velocityRef.current = velocityRef.current.add(
+        gravityRef.current.multiply(seconds - 1.1 * seconds * percentUnderWater)
+      );
+      velocityRef.current = velocityRef.current.subtract(
+        velocityRef.current.unit().multiply(percentUnderWater * seconds * velocityRef.current.dot(velocityRef.current))
+      );
+      centerRef.current = centerRef.current.add(velocityRef.current.multiply(seconds));
+      
+      if (centerRef.current.y < radiusRef.current - 1) {
+        centerRef.current.y = radiusRef.current - 1;
+        velocityRef.current.y = Math.abs(velocityRef.current.y) * 0.7;
       }
     }
     
-    // Move all spheres in water simulation
-    for (const sphere of renderer.spheres) {
-      water.moveSphere(sphere.oldCenter, sphere.center, sphere.radius);
-      sphere.oldCenter = sphere.center.clone();
-    }
-    
-    // Apply animated waves (hybrid system)
-    if (water.settings.animatedWaveEnabled) {
-      water.applyAnimatedWaves(timeRef.current, lastInteractionRef.current);
-    }
+    water.moveSphere(oldCenterRef.current, centerRef.current, radiusRef.current);
+    oldCenterRef.current = centerRef.current;
     
     water.stepSimulation();
     water.stepSimulation();
@@ -167,29 +136,15 @@ export function useWebGLWater(canvasRef: React.RefObject<HTMLCanvasElement | nul
     const tracer = new Raytracer(gl);
     const ray = tracer.getRayForPixel(x * ratio, y * ratio);
     const pointOnPlane = tracer.eye.add(ray.multiply(-tracer.eye.y / ray.y));
+    const sphereHitTest = Raytracer.hitTestSphere(tracer.eye, ray, centerRef.current, radiusRef.current);
     
-    // Check if we hit any sphere
-    let closestSphere = -1;
-    let closestT = Infinity;
-    
-    for (let i = 0; i < renderer.spheres.length; i++) {
-      const sphere = renderer.spheres[i];
-      const hit = Raytracer.hitTestSphere(tracer.eye, ray, sphere.center, sphere.radius);
-      if (hit && hit.t < closestT) {
-        closestT = hit.t;
-        closestSphere = i;
-        prevHitRef.current = hit.hit;
-      }
-    }
-    
-    if (closestSphere >= 0) {
+    if (sphereHitTest && sphereHitTest.hit) {
       modeRef.current = MODE_MOVE_SPHERE;
-      selectedSphereRef.current = closestSphere;
+      prevHitRef.current = sphereHitTest.hit;
       planeNormalRef.current = tracer.getRayForPixel(gl.canvas.width / 2, gl.canvas.height / 2).negative();
     } else if (Math.abs(pointOnPlane.x) < 1 && Math.abs(pointOnPlane.z) < 1) {
       modeRef.current = MODE_ADD_DROPS;
-      lastInteractionRef.current = new Vector(pointOnPlane.x, 0, pointOnPlane.z);
-      water.addDrop(pointOnPlane.x, pointOnPlane.z);
+      water.addDrop(pointOnPlane.x, pointOnPlane.z, 0.03, 0.01);
       if (pausedRef.current) {
         water.updateNormals();
         renderer.updateCaustics(water);
@@ -212,8 +167,7 @@ export function useWebGLWater(canvasRef: React.RefObject<HTMLCanvasElement | nul
         const tracer = new Raytracer(gl);
         const ray = tracer.getRayForPixel(x * ratio, y * ratio);
         const pointOnPlane = tracer.eye.add(ray.multiply(-tracer.eye.y / ray.y));
-        lastInteractionRef.current = new Vector(pointOnPlane.x, 0, pointOnPlane.z);
-        water.addDrop(pointOnPlane.x, pointOnPlane.z);
+        water.addDrop(pointOnPlane.x, pointOnPlane.z, 0.03, 0.01);
         if (pausedRef.current) {
           water.updateNormals();
           renderer.updateCaustics(water);
@@ -222,17 +176,14 @@ export function useWebGLWater(canvasRef: React.RefObject<HTMLCanvasElement | nul
       }
       case MODE_MOVE_SPHERE: {
         if (!prevHitRef.current || !planeNormalRef.current) break;
-        if (selectedSphereRef.current < 0 || selectedSphereRef.current >= renderer.spheres.length) break;
-        
-        const sphere = renderer.spheres[selectedSphereRef.current];
         const tracer = new Raytracer(gl);
         const ray = tracer.getRayForPixel(x * ratio, y * ratio);
         const t = -planeNormalRef.current.dot(tracer.eye.subtract(prevHitRef.current)) / planeNormalRef.current.dot(ray);
         const nextHit = tracer.eye.add(ray.multiply(t));
-        sphere.center = sphere.center.add(nextHit.subtract(prevHitRef.current));
-        sphere.center.x = Math.max(sphere.radius - 1, Math.min(1 - sphere.radius, sphere.center.x));
-        sphere.center.y = Math.max(sphere.radius - 1, Math.min(10, sphere.center.y));
-        sphere.center.z = Math.max(sphere.radius - 1, Math.min(1 - sphere.radius, sphere.center.z));
+        centerRef.current = centerRef.current.add(nextHit.subtract(prevHitRef.current));
+        centerRef.current.x = Math.max(radiusRef.current - 1, Math.min(1 - radiusRef.current, centerRef.current.x));
+        centerRef.current.y = Math.max(radiusRef.current - 1, Math.min(10, centerRef.current.y));
+        centerRef.current.z = Math.max(radiusRef.current - 1, Math.min(1 - radiusRef.current, centerRef.current.z));
         prevHitRef.current = nextHit;
         if (pausedRef.current) renderer.updateCaustics(water);
         break;
@@ -251,7 +202,6 @@ export function useWebGLWater(canvasRef: React.RefObject<HTMLCanvasElement | nul
   
   const handlePointerEnd = useCallback(() => {
     modeRef.current = -1;
-    selectedSphereRef.current = -1;
   }, []);
   
   const toggleGravity = useCallback(() => {
@@ -262,26 +212,6 @@ export function useWebGLWater(canvasRef: React.RefObject<HTMLCanvasElement | nul
   const togglePause = useCallback(() => {
     pausedRef.current = !pausedRef.current;
     return pausedRef.current;
-  }, []);
-  
-  const updateWaterSettings = useCallback((newSettings: Partial<WaterSettings>) => {
-    if (waterRef.current) {
-      waterRef.current.updateSettings(newSettings);
-      setSettings(prev => ({
-        ...prev,
-        water: { ...prev.water, ...newSettings }
-      }));
-    }
-  }, []);
-  
-  const updateRenderSettings = useCallback((newSettings: Partial<RenderSettings>) => {
-    if (rendererRef.current) {
-      rendererRef.current.updateSettings(newSettings);
-      setSettings(prev => ({
-        ...prev,
-        render: { ...prev.render, ...newSettings }
-      }));
-    }
   }, []);
   
   // Initialize WebGL
@@ -311,14 +241,9 @@ export function useWebGLWater(canvasRef: React.RefObject<HTMLCanvasElement | nul
         throw new Error('Rendering to floating-point textures is required but not supported');
       }
       
-      // Initialize renderer with multi-sphere support
-      const renderer = new Renderer(gl, tileCanvas, 8);
+      // Initialize renderer
+      const renderer = new Renderer(gl, tileCanvas);
       rendererRef.current = renderer;
-      
-      // Add default spheres
-      for (const sphereConfig of DEFAULT_SPHERES) {
-        renderer.addSphere(sphereConfig.center, sphereConfig.radius, sphereConfig.color);
-      }
       
       // Initialize cubemap
       const cubemap = new Cubemap(gl, skyTextures);
@@ -363,13 +288,10 @@ export function useWebGLWater(canvasRef: React.RefObject<HTMLCanvasElement | nul
   return {
     isInitialized,
     error,
-    settings,
     handlePointerStart,
     handlePointerMove,
     handlePointerEnd,
     toggleGravity,
-    togglePause,
-    updateWaterSettings,
-    updateRenderSettings
+    togglePause
   };
 }
