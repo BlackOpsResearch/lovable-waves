@@ -132,6 +132,17 @@ export class Texture {
     return texture;
   }
 
+  static fromFloatArray(gl: GLContextExtended, width: number, height: number, data: Float32Array, options: TextureOptions = {}): Texture {
+    const texture = new Texture(gl, width, height, { 
+      ...options, 
+      type: gl.FLOAT,
+      format: gl.RGBA
+    });
+    gl.bindTexture(gl.TEXTURE_2D, texture.id);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, height, 0, gl.RGBA, gl.FLOAT, data);
+    return texture;
+  }
+
   static canUseFloatingPointTextures(gl: GLContextExtended): boolean {
     return !!gl.getExtension('OES_texture_float');
   }
