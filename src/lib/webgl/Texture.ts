@@ -132,14 +132,26 @@ export class Texture {
     return texture;
   }
 
-  static fromFloatArray(gl: GLContextExtended, width: number, height: number, data: Float32Array, options: TextureOptions = {}): Texture {
+  static fromFloatArray(gl: GLContextExtended, data: Float32Array, width: number, height: number, options: TextureOptions = {}): Texture {
+    // Enable float textures extension
+    gl.getExtension('OES_texture_float');
+    gl.getExtension('OES_texture_float_linear');
+    
     const texture = new Texture(gl, width, height, { 
       ...options, 
       type: gl.FLOAT,
-      format: gl.RGBA
+      format: gl.RGBA,
+      filter: gl.LINEAR
     });
     gl.bindTexture(gl.TEXTURE_2D, texture.id);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, height, 0, gl.RGBA, gl.FLOAT, data);
+    return texture;
+  }
+
+  static fromCanvas(gl: GLContextExtended, canvas: HTMLCanvasElement, options: TextureOptions = {}): Texture {
+    const texture = new Texture(gl, canvas.width, canvas.height, options);
+    gl.bindTexture(gl.TEXTURE_2D, texture.id);
+    gl.texImage2D(gl.TEXTURE_2D, 0, texture.format, texture.format, texture.type, canvas);
     return texture;
   }
 
