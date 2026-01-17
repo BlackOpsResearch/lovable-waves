@@ -176,7 +176,7 @@ export class OceanSimulation {
       }
     }
     
-    this.noiseTexture = Texture.fromFloatArray(this.gl, atlasSize, atlasSize, atlasData);
+    this.noiseTexture = Texture.fromFloatArray(this.gl, atlasData, atlasSize, atlasSize);
   }
   
   addDrop(x: number, y: number, radius: number, strength: number) {
