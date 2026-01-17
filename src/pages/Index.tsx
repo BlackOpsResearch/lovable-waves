@@ -1,7 +1,7 @@
-import WebGLWater from '@/components/WebGLWater';
+import OceanWater from '@/components/OceanWater';
 
 const Index = () => {
-  return <WebGLWater />;
+  return <OceanWater />;
 };
 
 export default Index;
