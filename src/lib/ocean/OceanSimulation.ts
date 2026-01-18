@@ -1,7 +1,6 @@
 /**
- * Enhanced Ocean Simulation Engine
- * GPU-accelerated ocean waves with wind, caustics, and sphere interaction
- * Ported from GPT Waves V7
+ * Ocean Simulation Engine
+ * Manages GPU-accelerated ocean waves, caustics, and sphere interaction
  */
 
 import { GLContextExtended } from '../webgl/GLContext';
@@ -10,50 +9,18 @@ import { Shader } from '../webgl/Shader';
 import { Texture } from '../webgl/Texture';
 import { Vector } from '../webgl/Vector';
 import { generate3DNoiseTexture } from './noise/ImprovedNoise';
-import {
-  SIMULATION_VERTEX,
-  DROP_FRAGMENT,
-  IMPULSE_FRAGMENT,
-  UPDATE_FRAGMENT,
-  NORMAL_FRAGMENT,
-  SPHERE_FRAGMENT,
-  WIND_WAVES_FRAGMENT
-} from './shaders/simulationShaders';
-
-export interface OceanSimulationSettings {
-  resolution: number;
-  damping: number;
-  waveSpeed: number;
-  windDirection: [number, number];
-  windStrength: number;
-  waveScale: number;
-  enableWindWaves: boolean;
-}
-
-const DEFAULT_SETTINGS: OceanSimulationSettings = {
-  resolution: 256,
-  damping: 0.997,
-  waveSpeed: 0.5,
-  windDirection: [1.0, 0.3],
-  windStrength: 0.15,
-  waveScale: 3.0,
-  enableWindWaves: true
-};
 
 export class OceanSimulation {
   gl: GLContextExtended;
   plane: Mesh;
   textureA: Texture;
   textureB: Texture;
-  settings: OceanSimulationSettings;
   
   // Simulation shaders
   dropShader: Shader;
-  impulseShader: Shader;
   updateShader: Shader;
   normalShader: Shader;
   sphereShader: Shader;
-  windShader: Shader | null = null;
   
   // Cloud noise texture (2D packed for WebGL1 compatibility)
   noiseTexture: Texture | null = null;
@@ -61,10 +28,16 @@ export class OceanSimulation {
   // Animation
   time: number = 0;
   
-  constructor(gl: GLContextExtended, settings: Partial<OceanSimulationSettings> = {}) {
+  constructor(gl: GLContextExtended, resolution: number = 256) {
     this.gl = gl;
-    this.settings = { ...DEFAULT_SETTINGS, ...settings };
-    const resolution = this.settings.resolution;
+    
+    const vertexShader = `
+      varying vec2 coord;
+      void main() {
+        coord = gl_Vertex.xy * 0.5 + 0.5;
+        gl_Position = vec4(gl_Vertex.xyz, 1.0);
+      }
+    `;
     
     this.plane = Mesh.plane(gl);
     
@@ -84,28 +57,97 @@ export class OceanSimulation {
       this.textureB = new Texture(gl, resolution, resolution, { type: gl.HALF_FLOAT_OES, filter });
     }
     
-    // Create simulation shaders
-    this.dropShader = new Shader(gl, SIMULATION_VERTEX, DROP_FRAGMENT);
-    this.impulseShader = new Shader(gl, SIMULATION_VERTEX, IMPULSE_FRAGMENT);
-    this.updateShader = new Shader(gl, SIMULATION_VERTEX, UPDATE_FRAGMENT);
-    this.normalShader = new Shader(gl, SIMULATION_VERTEX, NORMAL_FRAGMENT);
-    this.sphereShader = new Shader(gl, SIMULATION_VERTEX, SPHERE_FRAGMENT);
-    
-    // Wind waves shader (optional)
-    if (this.settings.enableWindWaves) {
-      try {
-        this.windShader = new Shader(gl, SIMULATION_VERTEX, WIND_WAVES_FRAGMENT);
-      } catch (e) {
-        console.warn('Wind waves shader failed to compile, disabling:', e);
-        this.windShader = null;
+    // Drop shader - add ripples
+    this.dropShader = new Shader(gl, vertexShader, `
+      const float PI = 3.141592653589793;
+      uniform sampler2D texture;
+      uniform vec2 center;
+      uniform float radius;
+      uniform float strength;
+      varying vec2 coord;
+      
+      void main() {
+        vec4 info = texture2D(texture, coord);
+        float drop = max(0.0, 1.0 - length(center * 0.5 + 0.5 - coord) / radius);
+        drop = 0.5 - cos(drop * PI) * 0.5;
+        info.r += drop * strength;
+        gl_FragColor = info;
       }
-    }
+    `);
     
-    // Generate noise texture for clouds
+    // Update shader - wave propagation with ocean-like damping
+    this.updateShader = new Shader(gl, vertexShader, `
+      uniform sampler2D texture;
+      uniform vec2 delta;
+      uniform float damping;
+      varying vec2 coord;
+      
+      void main() {
+        vec4 info = texture2D(texture, coord);
+        vec2 dx = vec2(delta.x, 0.0);
+        vec2 dy = vec2(0.0, delta.y);
+        
+        float average = (
+          texture2D(texture, coord - dx).r +
+          texture2D(texture, coord - dy).r +
+          texture2D(texture, coord + dx).r +
+          texture2D(texture, coord + dy).r
+        ) * 0.25;
+        
+        info.g += (average - info.r) * 2.0;
+        info.g *= damping; // Ocean waves persist longer
+        info.r += info.g;
+        
+        gl_FragColor = info;
+      }
+    `);
+    
+    // Normal calculation shader
+    this.normalShader = new Shader(gl, vertexShader, `
+      uniform sampler2D texture;
+      uniform vec2 delta;
+      varying vec2 coord;
+      
+      void main() {
+        vec4 info = texture2D(texture, coord);
+        vec3 dx = vec3(delta.x, texture2D(texture, vec2(coord.x + delta.x, coord.y)).r - info.r, 0.0);
+        vec3 dy = vec3(0.0, texture2D(texture, vec2(coord.x, coord.y + delta.y)).r - info.r, delta.y);
+        info.ba = normalize(cross(dy, dx)).xz;
+        gl_FragColor = info;
+      }
+    `);
+    
+    // Sphere displacement shader
+    this.sphereShader = new Shader(gl, vertexShader, `
+      uniform sampler2D texture;
+      uniform vec3 oldCenter;
+      uniform vec3 newCenter;
+      uniform float radius;
+      varying vec2 coord;
+      
+      float volumeInSphere(vec3 center) {
+        vec3 toCenter = vec3(coord.x * 2.0 - 1.0, 0.0, coord.y * 2.0 - 1.0) - center;
+        float t = length(toCenter) / radius;
+        float dy = exp(-pow(t * 1.5, 6.0));
+        float ymin = min(0.0, center.y - dy);
+        float ymax = min(max(0.0, center.y + dy), ymin + 2.0 * dy);
+        return (ymax - ymin) * 0.1;
+      }
+      
+      void main() {
+        vec4 info = texture2D(texture, coord);
+        info.r += volumeInSphere(oldCenter);
+        info.r -= volumeInSphere(newCenter);
+        gl_FragColor = info;
+      }
+    `);
+    
+    // Generate noise texture for clouds (2D atlas for WebGL1)
     this.generateNoiseTexture();
   }
   
   private generateNoiseTexture() {
+    const size = 256;
     const data = generate3DNoiseTexture(64, Date.now(), 5, 0.5, 2.0, 3.5);
     
     // Pack 3D noise into 2D atlas (8x8 slices of 64x64)
@@ -142,7 +184,6 @@ export class OceanSimulation {
     this.textureB.drawTo(() => {
       self.textureA.bind();
       self.dropShader.uniforms({
-        texture: 0,
         center: [x, y],
         radius,
         strength
@@ -151,67 +192,26 @@ export class OceanSimulation {
     this.textureB.swapWith(this.textureA);
   }
   
-  addImpulse(x: number, y: number, radius: number, strength: number) {
-    const self = this;
-    this.textureB.drawTo(() => {
-      self.textureA.bind();
-      self.impulseShader.uniforms({
-        texture: 0,
-        center: [x, y],
-        radius,
-        strength
-      }).draw(self.plane);
-    });
-    this.textureB.swapWith(this.textureA);
-  }
-  
-  moveSphere(oldCenter: Vector, newCenter: Vector, radius: number, displacementScale: number = 1.0) {
+  moveSphere(oldCenter: Vector, newCenter: Vector, radius: number) {
     const self = this;
     this.textureB.drawTo(() => {
       self.textureA.bind();
       self.sphereShader.uniforms({
-        texture: 0,
         oldCenter,
         newCenter,
-        radius,
-        displacementScale
+        radius
       }).draw(self.plane);
     });
     this.textureB.swapWith(this.textureA);
   }
   
-  stepSimulation() {
+  stepSimulation(damping: number = 0.997) {
     const self = this;
-    const delta = [1 / this.textureA.width, 1 / this.textureA.height];
-    
     this.textureB.drawTo(() => {
       self.textureA.bind();
       self.updateShader.uniforms({
-        texture: 0,
-        delta,
-        damping: self.settings.damping,
-        waveSpeed: self.settings.waveSpeed
-      }).draw(self.plane);
-    });
-    this.textureB.swapWith(this.textureA);
-  }
-  
-  applyWindWaves(deltaTime: number) {
-    if (!this.windShader) return;
-    
-    const self = this;
-    const windDir = this.settings.windDirection;
-    const len = Math.sqrt(windDir[0] * windDir[0] + windDir[1] * windDir[1]);
-    const normalizedWind = len > 0 ? [windDir[0] / len, windDir[1] / len] : [1, 0];
-    
-    this.textureB.drawTo(() => {
-      self.textureA.bind();
-      self.windShader!.uniforms({
-        texture: 0,
-        time: self.time,
-        windDir: normalizedWind,
-        windStrength: self.settings.windStrength * deltaTime,
-        waveScale: self.settings.waveScale
+        delta: [1 / self.textureA.width, 1 / self.textureA.height],
+        damping
       }).draw(self.plane);
     });
     this.textureB.swapWith(this.textureA);
@@ -219,13 +219,10 @@ export class OceanSimulation {
   
   updateNormals() {
     const self = this;
-    const delta = [1 / this.textureA.width, 1 / this.textureA.height];
-    
     this.textureB.drawTo(() => {
       self.textureA.bind();
       self.normalShader.uniforms({
-        texture: 0,
-        delta
+        delta: [1 / self.textureA.width, 1 / self.textureA.height]
       }).draw(self.plane);
     });
     this.textureB.swapWith(this.textureA);
@@ -233,12 +230,6 @@ export class OceanSimulation {
   
   update(deltaTime: number) {
     this.time += deltaTime;
-    
-    // Apply wind-driven waves periodically
-    if (this.settings.enableWindWaves && this.windShader) {
-      this.applyWindWaves(deltaTime);
-    }
-    
     this.stepSimulation();
     this.updateNormals();
   }
@@ -249,21 +240,5 @@ export class OceanSimulation {
   
   getNoiseTexture(): Texture | null {
     return this.noiseTexture;
-  }
-  
-  getTime(): number {
-    return this.time;
-  }
-  
-  setWindDirection(x: number, z: number) {
-    this.settings.windDirection = [x, z];
-  }
-  
-  setWindStrength(strength: number) {
-    this.settings.windStrength = strength;
-  }
-  
-  setDamping(damping: number) {
-    this.settings.damping = damping;
   }
 }
