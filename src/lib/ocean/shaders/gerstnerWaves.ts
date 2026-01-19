@@ -5,8 +5,11 @@
 
 // GLSL Gerstner wave functions for vertex displacement
 export const GERSTNER_WAVE_FUNCTIONS = /* glsl */ `
+  #ifndef GERSTNER_PI_DEFINED
+  #define GERSTNER_PI_DEFINED
   const float PI = 3.14159265359;
   const float TAU = 6.28318530718;
+  #endif
   
   struct GerstnerWave {
     vec2 direction;     // Normalized wave direction
