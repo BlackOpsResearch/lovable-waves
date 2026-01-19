@@ -82,7 +82,9 @@ export class HyperOceanRenderer {
     const helperFunctions = `
       const float IOR_AIR = 1.0;
       const float IOR_WATER = 1.333;
+      #ifndef PI
       const float PI = 3.14159265359;
+      #endif
       
       uniform vec3 light;
       uniform vec3 sphereCenter;
@@ -91,7 +93,6 @@ export class HyperOceanRenderer {
       uniform sampler2D causticTex;
       uniform float time;
       
-      ${GERSTNER_WAVE_FUNCTIONS}
       ${NOISE_FUNCTIONS}
       
       vec2 intersectCube(vec3 origin, vec3 ray, vec3 cubeMin, vec3 cubeMax) {
