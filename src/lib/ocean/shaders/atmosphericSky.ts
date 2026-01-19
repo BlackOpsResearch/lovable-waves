@@ -143,8 +143,11 @@ export const ATMOSPHERIC_SKY_FRAGMENT = /* glsl */ `
 
 // Atmospheric color calculation for water shader integration
 export const ATMOSPHERIC_FUNCTIONS = /* glsl */ `
+  #ifndef ATMOS_CONSTANTS_DEFINED
+  #define ATMOS_CONSTANTS_DEFINED
   const float E = 2.71828182845904523536;
   const float PI = 3.141592653589793;
+  #endif
   const float SKY_CUTOFF_ANGLE = 1.6110731556870734;
   const float SKY_STEEPNESS = 1.5;
   const float SKY_EE = 1000.0;
