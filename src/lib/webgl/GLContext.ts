@@ -1,13 +1,15 @@
 /**
- * Enhanced WebGL Context with matrix stack and utilities
- * Ported from Evan Wallace's lightgl.js
+ * Enhanced WebGL2 Context with matrix stack and utilities
+ * Upgraded from WebGL1 to WebGL2 with fallback support
+ * Ported from Evan Wallace's lightgl.js with WebGL2 extensions
  */
 import { Matrix } from './Matrix';
 import { Vector } from './Vector';
 
 const ENUM = 0x12340000;
 
-export interface GLContextExtended extends WebGLRenderingContext {
+export interface GLContextExtended extends WebGL2RenderingContext {
+  // Matrix stack extensions
   MODELVIEW: number;
   PROJECTION: number;
   HALF_FLOAT_OES: number;
@@ -28,27 +30,126 @@ export interface GLContextExtended extends WebGLRenderingContext {
   popMatrix: () => void;
   project: (objX: number, objY: number, objZ: number, modelview?: Matrix, projection?: Matrix, viewport?: number[]) => Vector;
   unProject: (winX: number, winY: number, winZ: number, modelview?: Matrix, projection?: Matrix, viewport?: number[]) => Vector;
+  
+  // WebGL2 feature flags
+  isWebGL2: boolean;
+  hasFloatBlend: boolean;
+  hasColorBufferFloat: boolean;
+  hasFloatLinear: boolean;
+  maxTextureUnits: number;
+  maxVertexTextureUnits: number;
+  maxDrawBuffers: number;
+}
+
+export interface WebGL2Features {
+  isWebGL2: boolean;
+  hasFloatTextures: boolean;
+  hasFloatLinear: boolean;
+  hasFloatBlend: boolean;
+  hasColorBufferFloat: boolean;
+  has3DTextures: boolean;
+  hasTransformFeedback: boolean;
+  hasVertexArrayObject: boolean;
+  hasMultipleRenderTargets: boolean;
+  maxTextureUnits: number;
+  maxVertexTextureUnits: number;
+  maxDrawBuffers: number;
+  maxTextureSize: number;
+  max3DTextureSize: number;
+}
+
+export function getWebGL2Features(gl: GLContextExtended): WebGL2Features {
+  return {
+    isWebGL2: gl.isWebGL2,
+    hasFloatTextures: true, // Always available in WebGL2
+    hasFloatLinear: gl.hasFloatLinear,
+    hasFloatBlend: gl.hasFloatBlend,
+    hasColorBufferFloat: gl.hasColorBufferFloat,
+    has3DTextures: gl.isWebGL2,
+    hasTransformFeedback: gl.isWebGL2,
+    hasVertexArrayObject: gl.isWebGL2,
+    hasMultipleRenderTargets: gl.isWebGL2,
+    maxTextureUnits: gl.maxTextureUnits,
+    maxVertexTextureUnits: gl.maxVertexTextureUnits,
+    maxDrawBuffers: gl.maxDrawBuffers,
+    maxTextureSize: gl.getParameter(gl.MAX_TEXTURE_SIZE),
+    max3DTextureSize: gl.isWebGL2 ? gl.getParameter(gl.MAX_3D_TEXTURE_SIZE) : 0,
+  };
 }
 
 export function createGLContext(canvas: HTMLCanvasElement, options: WebGLContextAttributes = {}): GLContextExtended | null {
   if (!('alpha' in options)) options.alpha = false;
+  if (!('antialias' in options)) options.antialias = true;
+  if (!('depth' in options)) options.depth = true;
+  if (!('stencil' in options)) options.stencil = false;
+  if (!('preserveDrawingBuffer' in options)) options.preserveDrawingBuffer = false;
   
-  let gl: WebGLRenderingContext | null = null;
+  let gl: WebGL2RenderingContext | WebGLRenderingContext | null = null;
+  let isWebGL2 = false;
+  
+  // Try WebGL2 first
   try {
-    gl = canvas.getContext('webgl', options);
+    gl = canvas.getContext('webgl2', options);
+    if (gl) {
+      isWebGL2 = true;
+      console.log('WebGL2 context created successfully');
+    }
   } catch (e) {
-    // Ignore
-  }
-  try {
-    gl = gl || canvas.getContext('experimental-webgl', options) as WebGLRenderingContext;
-  } catch (e) {
-    // Ignore
+    console.warn('WebGL2 not available, falling back to WebGL1');
   }
   
-  if (!gl) return null;
+  // Fall back to WebGL1
+  if (!gl) {
+    try {
+      gl = canvas.getContext('webgl', options);
+    } catch (e) {
+      // Ignore
+    }
+    try {
+      gl = gl || canvas.getContext('experimental-webgl', options) as WebGLRenderingContext;
+    } catch (e) {
+      // Ignore
+    }
+  }
+  
+  if (!gl) {
+    console.error('WebGL not supported');
+    return null;
+  }
 
   const glExt = gl as GLContextExtended;
-  glExt.HALF_FLOAT_OES = 0x8d61;
+  glExt.isWebGL2 = isWebGL2;
+  
+  // Setup extensions and feature flags
+  if (isWebGL2) {
+    // WebGL2 has HALF_FLOAT built-in
+    glExt.HALF_FLOAT_OES = (gl as WebGL2RenderingContext).HALF_FLOAT;
+    
+    // Enable WebGL2 extensions
+    glExt.hasColorBufferFloat = !!gl.getExtension('EXT_color_buffer_float');
+    glExt.hasFloatBlend = !!gl.getExtension('EXT_float_blend');
+    glExt.hasFloatLinear = true; // Built into WebGL2
+    
+    // Get standard derivatives (built into WebGL2)
+    // OES_standard_derivatives is part of WebGL2 core
+  } else {
+    // WebGL1 extensions
+    const halfFloatExt = gl.getExtension('OES_texture_half_float');
+    glExt.HALF_FLOAT_OES = halfFloatExt ? halfFloatExt.HALF_FLOAT_OES : 0x8d61;
+    
+    gl.getExtension('OES_texture_float');
+    glExt.hasFloatLinear = !!gl.getExtension('OES_texture_float_linear');
+    gl.getExtension('OES_texture_half_float_linear');
+    gl.getExtension('OES_standard_derivatives');
+    
+    glExt.hasColorBufferFloat = false;
+    glExt.hasFloatBlend = false;
+  }
+  
+  // Get capability limits
+  glExt.maxTextureUnits = gl.getParameter(gl.MAX_TEXTURE_IMAGE_UNITS);
+  glExt.maxVertexTextureUnits = gl.getParameter(gl.MAX_VERTEX_TEXTURE_IMAGE_UNITS);
+  glExt.maxDrawBuffers = isWebGL2 ? gl.getParameter((gl as WebGL2RenderingContext).MAX_DRAW_BUFFERS) : 1;
   
   addMatrixStack(glExt);
   
@@ -163,4 +264,105 @@ function addMatrixStack(gl: GLContextExtended) {
   };
 
   gl.matrixMode(gl.MODELVIEW);
+}
+
+// Transform Feedback utilities for WebGL2
+export class TransformFeedback {
+  gl: GLContextExtended;
+  transformFeedback: WebGLTransformFeedback | null = null;
+  buffers: WebGLBuffer[] = [];
+  
+  constructor(gl: GLContextExtended, bufferCount: number = 1) {
+    this.gl = gl;
+    
+    if (!gl.isWebGL2) {
+      console.warn('Transform Feedback requires WebGL2');
+      return;
+    }
+    
+    const gl2 = gl as WebGL2RenderingContext;
+    this.transformFeedback = gl2.createTransformFeedback();
+    
+    for (let i = 0; i < bufferCount; i++) {
+      const buffer = gl2.createBuffer();
+      if (buffer) this.buffers.push(buffer);
+    }
+  }
+  
+  bind() {
+    if (!this.transformFeedback || !this.gl.isWebGL2) return;
+    const gl2 = this.gl as WebGL2RenderingContext;
+    gl2.bindTransformFeedback(gl2.TRANSFORM_FEEDBACK, this.transformFeedback);
+  }
+  
+  unbind() {
+    if (!this.gl.isWebGL2) return;
+    const gl2 = this.gl as WebGL2RenderingContext;
+    gl2.bindTransformFeedback(gl2.TRANSFORM_FEEDBACK, null);
+  }
+  
+  bindBufferBase(index: number, buffer: WebGLBuffer) {
+    if (!this.gl.isWebGL2) return;
+    const gl2 = this.gl as WebGL2RenderingContext;
+    gl2.bindBufferBase(gl2.TRANSFORM_FEEDBACK_BUFFER, index, buffer);
+  }
+  
+  begin(primitiveMode: number) {
+    if (!this.gl.isWebGL2) return;
+    const gl2 = this.gl as WebGL2RenderingContext;
+    gl2.beginTransformFeedback(primitiveMode);
+  }
+  
+  end() {
+    if (!this.gl.isWebGL2) return;
+    const gl2 = this.gl as WebGL2RenderingContext;
+    gl2.endTransformFeedback();
+  }
+  
+  destroy() {
+    if (!this.gl.isWebGL2) return;
+    const gl2 = this.gl as WebGL2RenderingContext;
+    if (this.transformFeedback) {
+      gl2.deleteTransformFeedback(this.transformFeedback);
+    }
+    for (const buffer of this.buffers) {
+      gl2.deleteBuffer(buffer);
+    }
+  }
+}
+
+// Vertex Array Object utilities
+export class VertexArrayObject {
+  gl: GLContextExtended;
+  vao: WebGLVertexArrayObject | null = null;
+  
+  constructor(gl: GLContextExtended) {
+    this.gl = gl;
+    
+    if (!gl.isWebGL2) {
+      console.warn('Vertex Array Objects require WebGL2');
+      return;
+    }
+    
+    const gl2 = gl as WebGL2RenderingContext;
+    this.vao = gl2.createVertexArray();
+  }
+  
+  bind() {
+    if (!this.vao || !this.gl.isWebGL2) return;
+    const gl2 = this.gl as WebGL2RenderingContext;
+    gl2.bindVertexArray(this.vao);
+  }
+  
+  unbind() {
+    if (!this.gl.isWebGL2) return;
+    const gl2 = this.gl as WebGL2RenderingContext;
+    gl2.bindVertexArray(null);
+  }
+  
+  destroy() {
+    if (!this.vao || !this.gl.isWebGL2) return;
+    const gl2 = this.gl as WebGL2RenderingContext;
+    gl2.deleteVertexArray(this.vao);
+  }
 }

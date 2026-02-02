@@ -1,6 +1,7 @@
 /**
- * Hyperrealistic Ocean Renderer
+ * Hyperrealistic Infinite Ocean Renderer
  * Advanced ocean rendering with Gerstner waves, atmospheric sky, LOD, and full water effects
+ * WebGL2 upgraded with infinite ocean mesh support
  */
 
 import { GLContextExtended } from '../webgl/GLContext';
@@ -12,14 +13,34 @@ import { Texture } from '../webgl/Texture';
 import { Vector } from '../webgl/Vector';
 import { OceanSimulation } from './OceanSimulation';
 import { OceanSettings, DEFAULT_OCEAN_SETTINGS, calculateSunPosition } from './OceanConfig';
+import { OceanMesh, createInfiniteOceanPlane } from './OceanMesh';
 
 // Import shader modules
-import { GERSTNER_WAVE_FUNCTIONS, NOISE_FUNCTIONS } from './shaders/gerstnerWaves';
+import { GERSTNER_WAVE_FUNCTIONS, NOISE_FUNCTIONS, INFINITE_OCEAN_VERTEX } from './shaders/gerstnerWaves';
 import { ATMOSPHERIC_FUNCTIONS } from './shaders/atmosphericSky';
+
+export interface InfiniteOceanOptions {
+  enableInfiniteOcean: boolean;
+  enableLOD: boolean;
+  oceanScale: number;
+  horizonDistance: number;
+  renderSeabed: boolean;
+  seabedDepth: number;
+}
+
+export const DEFAULT_INFINITE_OPTIONS: InfiniteOceanOptions = {
+  enableInfiniteOcean: true,
+  enableLOD: true,
+  oceanScale: 100,
+  horizonDistance: 10000,
+  renderSeabed: true,
+  seabedDepth: 50,
+};
 
 export class HyperOceanRenderer {
   gl: GLContextExtended;
   settings: OceanSettings;
+  infiniteOptions: InfiniteOceanOptions;
   
   // Textures
   tileTexture: Texture;
@@ -30,24 +51,33 @@ export class HyperOceanRenderer {
   sphereCenter: Vector;
   sphereRadius: number;
   time: number = 0;
+  cameraPosition: Vector = new Vector(0, 2, 5);
   
   // Meshes
   waterMesh: Mesh;
+  infiniteOceanMesh: OceanMesh | null = null;
   sphereMesh: Mesh;
   skyMesh: Mesh;
-  cubeMesh: Mesh;
+  seabedMesh: Mesh | null = null;
   
   // Shaders
   waterShaderAbove: Shader;
   waterShaderBelow: Shader;
+  infiniteWaterShader: Shader | null = null;
   sphereShader: Shader;
   skyShader: Shader;
-  cubeShader: Shader;
+  seabedShader: Shader | null = null;
   causticsShader: Shader;
   
-  constructor(gl: GLContextExtended, tileCanvas: HTMLCanvasElement, settings: OceanSettings = DEFAULT_OCEAN_SETTINGS) {
+  constructor(
+    gl: GLContextExtended, 
+    tileCanvas: HTMLCanvasElement, 
+    settings: OceanSettings = DEFAULT_OCEAN_SETTINGS,
+    infiniteOptions: InfiniteOceanOptions = DEFAULT_INFINITE_OPTIONS
+  ) {
     this.gl = gl;
     this.settings = settings;
+    this.infiniteOptions = infiniteOptions;
     
     // Initialize textures
     this.tileTexture = Texture.fromImage(gl, tileCanvas, {
@@ -69,7 +99,16 @@ export class HyperOceanRenderer {
     this.waterMesh = Mesh.plane(gl, { detail: settings.lod.maxDetail });
     this.sphereMesh = Mesh.sphere(gl, { detail: 16 });
     this.skyMesh = Mesh.sphere(gl, { detail: 32 });
-    this.cubeMesh = Mesh.cube(gl, { coords: true });
+    
+    // Create infinite ocean mesh if enabled
+    if (infiniteOptions.enableInfiniteOcean) {
+      this.infiniteOceanMesh = new OceanMesh(gl);
+      
+      // Create seabed mesh
+      if (infiniteOptions.renderSeabed) {
+        this.seabedMesh = createInfiniteOceanPlane(gl, 64);
+      }
+    }
     
     // Initialize shaders
     this.initShaders();
@@ -171,7 +210,7 @@ export class HyperOceanRenderer {
       }
     `;
     
-    // Above water fragment shader
+    // Above water fragment shader with infinite ocean support
     const aboveWaterFragment = helperFunctions + skyFunctions + `
       uniform vec3 eye;
       uniform vec3 sunDir;
@@ -183,11 +222,20 @@ export class HyperOceanRenderer {
       uniform vec3 deepColor;
       uniform vec3 scatterColor;
       uniform float foamIntensity;
+      uniform float seabedDepth;
+      uniform float horizonDistance;
       
       varying vec3 position;
       varying float foamFactor;
       varying float waveHeight;
       uniform samplerCube sky;
+      
+      // Horizon fog for infinite ocean
+      vec3 applyHorizonFog(vec3 color, float distance, vec3 fogColor) {
+        float fogFactor = 1.0 - exp(-distance * 0.0001);
+        fogFactor = clamp(fogFactor, 0.0, 0.95);
+        return mix(color, fogColor, fogFactor);
+      }
       
       vec3 getSurfaceRayColor(vec3 origin, vec3 ray, vec3 waterColor) {
         vec3 color;
@@ -195,14 +243,22 @@ export class HyperOceanRenderer {
         if (q < 1.0e6) {
           color = getSphereColor(origin + ray * q);
         } else if (ray.y < 0.0) {
-          float depth = -origin.y / ray.y;
-          vec3 floorPoint = origin + ray * depth;
-          float dist = length(floorPoint - origin);
-          
-          vec3 deepWaterColor = deepColor;
-          vec4 caustic = texture2D(causticTex, floorPoint.xz * 0.1);
-          deepWaterColor += caustic.rgb * 0.3 * exp(-dist * 0.5);
-          color = deepWaterColor;
+          // Infinite seabed
+          float depth = (-origin.y - seabedDepth) / ray.y;
+          if (depth > 0.0 && depth < horizonDistance) {
+            vec3 floorPoint = origin + ray * depth;
+            float dist = length(floorPoint - origin);
+            
+            // Caustics on seabed
+            vec3 refractedLight = refract(-light, vec3(0.0, 1.0, 0.0), IOR_AIR / IOR_WATER);
+            vec4 caustic = texture2D(causticTex, floorPoint.xz * 0.02);
+            
+            vec3 seabedColor = deepColor * 0.3;
+            seabedColor += caustic.rgb * 0.5 * exp(-dist * 0.05);
+            color = seabedColor;
+          } else {
+            color = deepColor * 0.1;
+          }
         } else {
           color = getAtmosphericSkyColor(ray, sunDir, turbidity, rayleighCoef, mieCoef, mieG);
           float sunSpec = pow(max(0.0, dot(ray, sunDir)), 500.0);
@@ -257,6 +313,11 @@ export class HyperOceanRenderer {
         vec3 halfVec = normalize(-incomingRay + sunDir);
         float spec = pow(max(0.0, dot(normal, halfVec)), 256.0);
         finalColor += vec3(1.0, 0.95, 0.8) * spec * 2.0;
+        
+        // Horizon fog
+        float distToCamera = length(position - eye);
+        vec3 horizonColor = getAtmosphericSkyColor(vec3(0.0, 0.1, 1.0), sunDir, turbidity, rayleighCoef, mieCoef, mieG);
+        finalColor = applyHorizonFog(finalColor, distToCamera, horizonColor);
         
         gl_FragColor = vec4(finalColor, 1.0);
       }
@@ -376,38 +437,51 @@ export class HyperOceanRenderer {
       }
     `);
     
-    // Cube/pool shader
-    this.cubeShader = new Shader(gl, helperFunctions + `
-      varying vec3 position;
-      void main() {
-        position = gl_Vertex.xyz;
-        position.y = ((1.0 - position.y) * (7.0 / 12.0) - 1.0) * 2.0;
-        gl_Position = gl_ModelViewProjectionMatrix * vec4(position, 1.0);
-      }
-    `, helperFunctions + `
-      uniform sampler2D tiles;
-      uniform vec3 underwaterColor;
-      varying vec3 position;
-      
-      void main() {
-        vec2 coord = position.xz * 0.5 + 0.5;
-        vec4 info = texture2D(water, coord);
+    // Seabed shader for infinite ocean
+    if (this.infiniteOptions.renderSeabed) {
+      this.seabedShader = new Shader(gl, `
+        uniform float seabedDepth;
+        uniform vec2 tileOffset;
+        uniform float oceanScale;
+        varying vec3 position;
+        varying vec2 vUV;
         
-        for (int i = 0; i < 5; i++) {
-          coord += info.ba * 0.005;
-          info = texture2D(water, coord);
+        void main() {
+          position = gl_Vertex.xyz;
+          position.xz = position.xz * oceanScale + tileOffset;
+          position.y = -seabedDepth;
+          vUV = gl_Vertex.xz * 0.5 + 0.5;
+          gl_Position = gl_ModelViewProjectionMatrix * vec4(position, 1.0);
         }
+      `, helperFunctions + `
+        uniform sampler2D tiles;
+        uniform vec3 underwaterColor;
+        uniform float seabedDepth;
+        varying vec3 position;
+        varying vec2 vUV;
         
-        vec3 normal = -vec3(info.b, sqrt(1.0 - dot(info.ba, info.ba)), info.a);
-        vec3 refractedLight = refract(-light, vec3(0.0, 1.0, 0.0), 0.75);
-        float diffuse = max(0.0, dot(-refractedLight, vec3(0.0, 1.0, 0.0)));
-        vec4 caustic = texture2D(causticTex, 0.75 * (position.xz - position.y * refractedLight.xz / refractedLight.y) * 0.5 + 0.5);
-        vec4 tile = texture2D(tiles, position.xz * 0.5 + 0.5);
-        diffuse *= caustic.r * 2.0;
-        
-        gl_FragColor = vec4(tile.rgb * (diffuse * 0.6 + 0.4) * underwaterColor, 1.0);
-      }
-    `);
+        void main() {
+          vec3 refractedLight = refract(-light, vec3(0.0, 1.0, 0.0), IOR_AIR / IOR_WATER);
+          float diffuse = max(0.0, dot(-refractedLight, vec3(0.0, 1.0, 0.0)));
+          
+          // Caustics
+          vec4 caustic = texture2D(causticTex, position.xz * 0.02);
+          
+          // Sand texture
+          vec4 sandColor = texture2D(tiles, position.xz * 0.05);
+          
+          vec3 color = sandColor.rgb * (diffuse * 0.5 + 0.3);
+          color += caustic.rgb * 0.4;
+          
+          // Depth fog
+          float depth = seabedDepth;
+          float fogFactor = 1.0 - exp(-depth * 0.02);
+          color = mix(color, underwaterColor * 0.3, fogFactor);
+          
+          gl_FragColor = vec4(color, 1.0);
+        }
+      `);
+    }
     
     // Caustics shader
     const hasDerivatives = !!gl.getExtension('OES_standard_derivatives');
@@ -462,6 +536,18 @@ export class HyperOceanRenderer {
       this.settings.atmosphere.sunAzimuth
     );
     this.sunDirection = new Vector(sunPos[0], sunPos[1], sunPos[2]).unit();
+  }
+  
+  updateInfiniteOptions(options: Partial<InfiniteOceanOptions>) {
+    this.infiniteOptions = { ...this.infiniteOptions, ...options };
+  }
+  
+  updateCameraPosition(x: number, y: number, z: number) {
+    this.cameraPosition = new Vector(x, y, z);
+    
+    if (this.infiniteOceanMesh) {
+      this.infiniteOceanMesh.updateCameraPosition(x, z);
+    }
   }
   
   updateCaustics(simulation: OceanSimulation) {
@@ -531,6 +617,8 @@ export class HyperOceanRenderer {
       foamIntensity: this.settings.material.foamIntensity,
       underwaterColor: this.settings.material.underwaterColor,
       fogDensity: this.settings.material.underwaterFogDensity,
+      seabedDepth: this.infiniteOptions.seabedDepth,
+      horizonDistance: this.infiniteOptions.horizonDistance,
     };
     
     // Render both sides
@@ -541,6 +629,31 @@ export class HyperOceanRenderer {
     this.waterShaderBelow.uniforms(commonUniforms).draw(this.waterMesh);
     
     gl.disable(gl.CULL_FACE);
+  }
+  
+  renderSeabed(simulation: OceanSimulation) {
+    if (!this.seabedShader || !this.seabedMesh) return;
+    
+    simulation.textureA.bind(0);
+    this.tileTexture.bind(1);
+    this.causticTex.bind(2);
+    
+    const tileOffset = this.infiniteOceanMesh 
+      ? [this.infiniteOceanMesh.tileOffset.x, this.infiniteOceanMesh.tileOffset.z]
+      : [0, 0];
+    
+    this.seabedShader.uniforms({
+      light: this.sunDirection,
+      water: 0,
+      tiles: 1,
+      causticTex: 2,
+      sphereCenter: this.sphereCenter,
+      sphereRadius: this.sphereRadius,
+      underwaterColor: this.settings.material.underwaterColor,
+      seabedDepth: this.infiniteOptions.seabedDepth,
+      tileOffset: tileOffset,
+      oceanScale: this.infiniteOptions.oceanScale,
+    }).draw(this.seabedMesh);
   }
   
   renderSphere(simulation: OceanSimulation) {
@@ -557,22 +670,6 @@ export class HyperOceanRenderer {
     }).draw(this.sphereMesh);
   }
   
-  renderCube(simulation: OceanSimulation) {
-    simulation.textureA.bind(0);
-    this.tileTexture.bind(1);
-    this.causticTex.bind(2);
-    
-    this.cubeShader.uniforms({
-      light: this.sunDirection,
-      water: 0,
-      tiles: 1,
-      causticTex: 2,
-      sphereCenter: this.sphereCenter,
-      sphereRadius: this.sphereRadius,
-      underwaterColor: this.settings.material.underwaterColor,
-    }).draw(this.cubeMesh);
-  }
-  
   update(deltaTime: number) {
     this.time += deltaTime;
   }
@@ -582,5 +679,12 @@ export class HyperOceanRenderer {
     this.settings.atmosphere.sunAzimuth = azimuth;
     const sunPos = calculateSunPosition(elevation, azimuth);
     this.sunDirection = new Vector(sunPos[0], sunPos[1], sunPos[2]).unit();
+  }
+  
+  destroy() {
+    this.causticTex.destroy();
+    if (this.infiniteOceanMesh) {
+      this.infiniteOceanMesh.destroy();
+    }
   }
 }
