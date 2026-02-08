@@ -1,0 +1,770 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OPUS Water Engine — Groups 1+2</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{overflow:hidden;background:#000;font-family:'Courier New',monospace}
+canvas{display:block;width:100vw;height:100vh}
+#hud{position:absolute;top:12px;left:12px;color:#0f0;font-size:13px;pointer-events:none;text-shadow:0 0 6px #000,0 0 2px #000;line-height:1.6}
+#info{position:absolute;bottom:12px;left:12px;color:rgba(180,200,220,0.7);font-size:11px;pointer-events:none;line-height:1.5}
+#mode{position:absolute;top:12px;right:12px;color:#ff0;font-size:14px;pointer-events:none;text-shadow:0 0 6px #000;text-align:right}
+.val{color:#0ff}.label{color:#8f8}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud"></div>
+<div id="mode"></div>
+<div id="info">
+<b style="color:#fff">OPUS Water Engine</b> — Groups 1+2: Infrastructure + Heightfield Foundation<br>
+<b>Click</b>: add impulse &nbsp;|&nbsp; <b>Drag</b>: orbit &nbsp;|&nbsp; <b>Scroll</b>: zoom<br>
+<b>Keys 0-4</b>: debug views (0=off, 1=height, 2=steepness, 3=curvature, 4=jacobian)<br>
+<b>R</b>: reset &nbsp;|&nbsp; <b>W</b>: wireframe
+</div>
+<script>
+'use strict';
+
+// ═══════════════════════════════════════════════════════════════════
+// CONFIGURATION — Orchestration §15 defaults
+// ═══════════════════════════════════════════════════════════════════
+const HF_RES      = 512;
+const WORLD_SIZE  = 200.0;
+const HALF_WORLD  = WORLD_SIZE * 0.5;
+const DEPTH       = 20.0;
+const GRAV        = 9.81;
+const DAMPING60   = 0.995;
+const MESH_SEG    = 256;
+const FOAM_THRESH = 0.35;
+const FOAM_INT    = 0.7;
+const SPEC_POW    = 256.0;
+const ENV_REFL    = 0.6;
+
+// ═══════════════════════════════════════════════════════════════════
+// WEBGL2 SETUP
+// ═══════════════════════════════════════════════════════════════════
+const canvas = document.getElementById('c');
+let W, H;
+function resize() { W = canvas.width = innerWidth; H = canvas.height = innerHeight; }
+resize();
+window.addEventListener('resize', resize);
+
+const gl = canvas.getContext('webgl2', { antialias: true, alpha: false, powerPreference: 'high-performance' });
+if (!gl) { document.body.innerHTML = '<h1 style="color:#f44;padding:40px">WebGL2 required</h1>'; throw 'No WebGL2'; }
+const extF = gl.getExtension('EXT_color_buffer_float');
+if (!extF) { document.body.innerHTML = '<h1 style="color:#f44;padding:40px">EXT_color_buffer_float required</h1>'; throw 'No float FBO'; }
+gl.getExtension('EXT_color_buffer_half_float');
+
+// ═══════════════════════════════════════════════════════════════════
+// SHADER UTILITIES
+// ═══════════════════════════════════════════════════════════════════
+function makeShader(type, src) {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+        console.error(gl.getShaderInfoLog(s));
+        src.split('\n').forEach((l,i) => console.log(`${i+1}: ${l}`));
+        return null;
+    }
+    return s;
+}
+function mkProg(vs, fs) {
+    const p = gl.createProgram();
+    gl.attachShader(p, makeShader(gl.VERTEX_SHADER, vs));
+    gl.attachShader(p, makeShader(gl.FRAGMENT_SHADER, fs));
+    gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) { console.error(gl.getProgramInfoLog(p)); return null; }
+    return p;
+}
+function U(p, ...n) { const o = {}; for (const k of n) o[k] = gl.getUniformLocation(p, k); return o; }
+
+// ═══════════════════════════════════════════════════════════════════
+// TEXTURE / FBO HELPERS
+// ═══════════════════════════════════════════════════════════════════
+function mkTex(w, h, filt = gl.LINEAR) {
+    const t = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, w, h, 0, gl.RGBA, gl.HALF_FLOAT, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filt);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filt);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    return t;
+}
+function mkFBO(t) {
+    const f = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, f);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
+    const st = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+    if (st !== gl.FRAMEBUFFER_COMPLETE) console.error('FBO status:', st);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    return f;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// GROUP 1: PING PONG (Double-buffered render target pair)
+// ═══════════════════════════════════════════════════════════════════
+class PingPong {
+    constructor(w, h, filt) {
+        this.tA = mkTex(w, h, filt); this.tB = mkTex(w, h, filt);
+        this.fA = mkFBO(this.tA);    this.fB = mkFBO(this.tB);
+        this._i = 0;
+    }
+    get read()  { return this._i === 0 ? this.tA : this.tB; }
+    get wfbo()  { return this._i === 0 ? this.fB : this.fA; }
+    get wtex()  { return this._i === 0 ? this.tB : this.tA; }
+    swap()      { this._i = 1 - this._i; }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// GROUP 1: PASS RUNNER (Fullscreen triangle)
+// ═══════════════════════════════════════════════════════════════════
+const fsVAO = gl.createVertexArray();
+
+const VS_FULL = `#version 300 es
+precision highp float;
+out vec2 v_uv;
+void main(){
+    float x = -1.0 + float((gl_VertexID & 1) << 2);
+    float y = -1.0 + float((gl_VertexID & 2) << 1);
+    v_uv = vec2(x, y) * 0.5 + 0.5;
+    gl_Position = vec4(x, y, 0.0, 1.0);
+}`;
+
+function runFullscreen(prog, fbo, w, h) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.viewport(0, 0, w, h);
+    gl.useProgram(prog);
+    gl.bindVertexArray(fsVAO);
+    gl.disable(gl.DEPTH_TEST);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// MATRIX MATH (minimal for camera)
+// ═══════════════════════════════════════════════════════════════════
+const M4 = {
+    create() { return new Float32Array(16); },
+    identity(o) { o.fill(0); o[0]=o[5]=o[10]=o[15]=1; return o; },
+    perspective(o, fov, asp, zn, zf) {
+        o.fill(0);
+        const f = 1/Math.tan(fov/2), nf = 1/(zn-zf);
+        o[0]=f/asp; o[5]=f; o[10]=(zf+zn)*nf; o[11]=-1; o[14]=2*zf*zn*nf;
+        return o;
+    },
+    lookAt(o, eye, cen, up) {
+        let zx=eye[0]-cen[0], zy=eye[1]-cen[1], zz=eye[2]-cen[2];
+        let l=1/Math.sqrt(zx*zx+zy*zy+zz*zz); zx*=l; zy*=l; zz*=l;
+        let xx=up[1]*zz-up[2]*zy, xy=up[2]*zx-up[0]*zz, xz=up[0]*zy-up[1]*zx;
+        l=Math.sqrt(xx*xx+xy*xy+xz*xz); if(l>1e-6){l=1/l; xx*=l; xy*=l; xz*=l;} else {xx=xy=xz=0;}
+        let yx=zy*xz-zz*xy, yy=zz*xx-zx*xz, yz=zx*xy-zy*xx;
+        o[0]=xx; o[1]=yx; o[2]=zx;  o[3]=0;
+        o[4]=xy; o[5]=yy; o[6]=zy;  o[7]=0;
+        o[8]=xz; o[9]=yz; o[10]=zz; o[11]=0;
+        o[12]=-(xx*eye[0]+xy*eye[1]+xz*eye[2]);
+        o[13]=-(yx*eye[0]+yy*eye[1]+yz*eye[2]);
+        o[14]=-(zx*eye[0]+zy*eye[1]+zz*eye[2]);
+        o[15]=1;
+        return o;
+    },
+    mul(o, a, b) {
+        for(let i=0;i<4;i++) for(let j=0;j<4;j++){
+            let s=0; for(let k=0;k<4;k++) s+=a[i+k*4]*b[k+j*4]; o[i+j*4]=s;
+        } return o;
+    },
+    invert(o, m) {
+        const a=m[0],b=m[1],c=m[2],d=m[3],e=m[4],f=m[5],g=m[6],h=m[7],
+              i=m[8],j=m[9],k=m[10],l=m[11],n=m[12],p=m[13],q=m[14],r=m[15];
+        const A=a*f-b*e, B=a*g-c*e, C=a*h-d*e, D=b*g-c*f, E=b*h-d*f, F=c*h-d*g,
+              G=i*p-j*n, H=i*q-k*n, I=i*r-l*n, J=j*q-k*p, K=j*r-l*p, L=k*r-l*q;
+        let det=A*L-B*K+C*J+D*I-E*H+F*G; if(Math.abs(det)<1e-12) return M4.identity(o);
+        det=1/det;
+        o[0]=(f*L-g*K+h*J)*det; o[1]=(c*K-b*L-d*J)*det; o[2]=(p*F-q*E+r*D)*det; o[3]=(k*E-j*F-l*D)*det;
+        o[4]=(g*I-e*L-h*H)*det; o[5]=(a*L-c*I+d*H)*det; o[6]=(q*C-n*F-r*B)*det; o[7]=(i*F-k*C+l*B)*det;
+        o[8]=(e*K-f*I+h*G)*det; o[9]=(b*I-a*K-d*G)*det; o[10]=(n*E-p*C+r*A)*det; o[11]=(j*C-i*E-l*A)*det;
+        o[12]=(f*H-e*J-g*G)*det; o[13]=(a*J-b*H+c*G)*det; o[14]=(p*B-n*D-q*A)*det; o[15]=(i*D-j*B+k*A)*det;
+        return o;
+    }
+};
+
+// ═══════════════════════════════════════════════════════════════════
+// SHADERS — Pass 1: SWE Heightfield Solver (Lax-Friedrichs)
+// ═══════════════════════════════════════════════════════════════════
+const SWE_FRAG = `#version 300 es
+precision highp float;
+precision highp sampler2D;
+uniform sampler2D u_hf;
+uniform vec2 u_res;
+uniform float u_worldSize, u_depth, u_gravity, u_dt;
+uniform vec2 u_worldOrigin;
+uniform float u_damping;
+uniform vec2 u_impC;
+uniform float u_impR, u_impS;
+in vec2 v_uv;
+out vec4 fc;
+void main(){
+    vec2 tx=1.0/u_res;
+    float dx=u_worldSize/u_res.x;
+    vec4 C=texture(u_hf,v_uv);
+    vec4 L=texture(u_hf,v_uv+vec2(-tx.x,0));
+    vec4 R=texture(u_hf,v_uv+vec2( tx.x,0));
+    vec4 D=texture(u_hf,v_uv+vec2(0,-tx.y));
+    vec4 Up=texture(u_hf,v_uv+vec2(0, tx.y));
+    float ea=.25*(L.r+R.r+D.r+Up.r);
+    float ua=.25*(L.b+R.b+D.b+Up.b);
+    float va=.25*(L.a+R.a+D.a+Up.a);
+    float dudx=(R.b-L.b)/(2.*dx);
+    float dvdz=(Up.a-D.a)/(2.*dx);
+    float er=-u_depth*(dudx+dvdz);
+    float dedx=(R.r-L.r)/(2.*dx);
+    float dedz=(Up.r-D.r)/(2.*dx);
+    float ne=ea+er*u_dt;
+    float nu=ua-u_gravity*dedx*u_dt;
+    float nv=va-u_gravity*dedz*u_dt;
+    vec2 wp=u_worldOrigin+v_uv*u_worldSize;
+    vec2 lp=v_uv*u_worldSize;
+    float sw=u_worldSize*.05;
+    float sp=smoothstep(0.,sw,lp.x)*smoothstep(0.,sw,u_worldSize-lp.x)
+            *smoothstep(0.,sw,lp.y)*smoothstep(0.,sw,u_worldSize-lp.y);
+    ne*=sp; nu*=sp; nv*=sp;
+    ne*=u_damping; nu*=u_damping; nv*=u_damping;
+    if(u_impS!=0.){
+        vec2 d=wp-u_impC;
+        ne+=u_impS*exp(-dot(d,d)/(u_impR*u_impR))*u_dt;
+    }
+    float ero=(ne-C.r)/max(u_dt,1e-6);
+    fc=vec4(ne,ero,nu,nv);
+}`;
+
+// ═══════════════════════════════════════════════════════════════════
+// SHADERS — Clear pass
+// ═══════════════════════════════════════════════════════════════════
+const CLEAR_FRAG = `#version 300 es
+precision highp float;
+out vec4 fc;
+void main(){ fc=vec4(0); }`;
+
+// ═══════════════════════════════════════════════════════════════════
+// SHADERS — Pass 2: Heightfield Diagnostics (macro-filtered)
+// ═══════════════════════════════════════════════════════════════════
+const DIAG_FRAG = `#version 300 es
+precision highp float;
+precision highp sampler2D;
+uniform sampler2D u_hf;
+uniform vec2 u_res;
+uniform float u_worldSize, u_stride;
+in vec2 v_uv;
+out vec4 fc;
+void main(){
+    vec2 tx=1.0/u_res;
+    vec2 st=tx*u_stride;
+    float dx=u_worldSize/u_res.x*u_stride;
+    float C=texture(u_hf,v_uv).r;
+    float L=texture(u_hf,v_uv+vec2(-st.x,0)).r;
+    float R=texture(u_hf,v_uv+vec2( st.x,0)).r;
+    float D=texture(u_hf,v_uv+vec2(0,-st.y)).r;
+    float Up=texture(u_hf,v_uv+vec2(0, st.y)).r;
+    float gx=(R-L)/(2.*dx);
+    float gz=(Up-D)/(2.*dx);
+    float steep=sqrt(gx*gx+gz*gz);
+    float curv=(L+R+D+Up-4.*C)/(dx*dx);
+    float jac=1.-steep*steep-abs(curv)*dx;
+    float er=texture(u_hf,v_uv).g;
+    fc=vec4(steep,curv,jac,er);
+}`;
+
+// ═══════════════════════════════════════════════════════════════════
+// SHADERS — Ocean Renderer (displaced mesh + PBR)
+// ═══════════════════════════════════════════════════════════════════
+const OCEAN_VS = `#version 300 es
+precision highp float;
+precision highp sampler2D;
+uniform sampler2D u_hf, u_diag;
+uniform mat4 u_proj, u_view;
+uniform vec2 u_origin;
+uniform float u_size;
+uniform vec2 u_hfRes;
+in vec2 a_uv;
+out vec3 v_wp;
+out vec3 v_N;
+out vec2 v_uv;
+out float v_steep, v_eta;
+void main(){
+    vec2 wXZ=u_origin+a_uv*u_size;
+    float eta=texture(u_hf,a_uv).r;
+    float dx=u_size/u_hfRes.x;
+    vec2 tx=1.0/u_hfRes;
+    float hL=texture(u_hf,a_uv+vec2(-tx.x,0)).r;
+    float hR=texture(u_hf,a_uv+vec2( tx.x,0)).r;
+    float hD=texture(u_hf,a_uv+vec2(0,-tx.y)).r;
+    float hU=texture(u_hf,a_uv+vec2(0, tx.y)).r;
+    v_N=normalize(vec3((hL-hR)/(2.*dx),1,(hD-hU)/(2.*dx)));
+    v_steep=texture(u_diag,a_uv).r;
+    v_wp=vec3(wXZ.x,eta,wXZ.y);
+    v_uv=a_uv;
+    v_eta=eta;
+    gl_Position=u_proj*u_view*vec4(v_wp,1);
+}`;
+
+const OCEAN_FS = `#version 300 es
+precision highp float;
+uniform vec3 u_eye, u_sunDir, u_sunCol, u_deep, u_shallow;
+uniform float u_foamTh, u_foamInt, u_specPow, u_envR;
+in vec3 v_wp, v_N;
+in vec2 v_uv;
+in float v_steep, v_eta;
+out vec4 fc;
+float fresnel(vec3 N,vec3 V,float F0){
+    float c=max(dot(N,V),0.);
+    return F0+(1.-F0)*pow(1.-c,5.);
+}
+void main(){
+    vec3 N=normalize(v_N);
+    vec3 V=normalize(u_eye-v_wp);
+    vec3 L=normalize(u_sunDir);
+    vec3 H=normalize(V+L);
+    float F=fresnel(N,V,.02);
+    float df=smoothstep(-2.,2.,v_eta);
+    vec3 base=mix(u_deep,u_shallow,df);
+    float wrap=max((dot(N,L)+.3)/1.3,0.);
+    vec3 diff=base*wrap*u_sunCol;
+    float NdH=max(dot(N,H),0.);
+    vec3 spec=u_sunCol*pow(NdH,u_specPow)*F;
+    vec3 R=reflect(-V,N);
+    float sf=max(R.y,0.);
+    vec3 sky=mix(vec3(.55,.65,.75),vec3(.15,.35,.75),sf);
+    vec3 env=sky*F*u_envR;
+    float foam=smoothstep(u_foamTh,u_foamTh+.15,v_steep)*u_foamInt;
+    vec3 col=mix(diff+spec+env,vec3(.85,.9,.95),foam);
+    fc=vec4(col,1);
+}`;
+
+// ═══════════════════════════════════════════════════════════════════
+// SHADERS — Debug Overlay
+// ═══════════════════════════════════════════════════════════════════
+const DBG_FRAG = `#version 300 es
+precision highp float;
+precision highp sampler2D;
+uniform sampler2D u_tex;
+uniform int u_mode;
+in vec2 v_uv;
+out vec4 fc;
+vec3 heatmap(float t){
+    t=clamp(t,0.,1.);
+    if(t<.25) return mix(vec3(0,0,1),vec3(0,1,1),t*4.);
+    if(t<.5)  return mix(vec3(0,1,1),vec3(0,1,0),(t-.25)*4.);
+    if(t<.75) return mix(vec3(0,1,0),vec3(1,1,0),(t-.5)*4.);
+    return mix(vec3(1,1,0),vec3(1,0,0),(t-.75)*4.);
+}
+void main(){
+    vec4 s=texture(u_tex,v_uv);
+    vec3 c=vec3(0);
+    float a=.65;
+    if(u_mode==1){c=heatmap((s.r+2.)/4.);}
+    else if(u_mode==2){c=mix(vec3(0),mix(vec3(1,1,0),vec3(1,0,0),clamp(s.r/.8,0.,1.)),clamp(s.r/.05,0.,1.));}
+    else if(u_mode==3){float v=s.g;c=v<0.?vec3(0,.3,1)*clamp(-v*.01,0.,1.):vec3(1,.2,.1)*clamp(v*.01,0.,1.);}
+    else if(u_mode==4){c=s.b>0.?vec3(.1,.8,.2)*clamp(s.b,0.,1.):vec3(1,.15,.1)*clamp(-s.b,0.,1.);}
+    fc=vec4(c,a);
+}`;
+
+// ═══════════════════════════════════════════════════════════════════
+// CREATE PROGRAMS & COLLECT UNIFORMS
+// ═══════════════════════════════════════════════════════════════════
+const pSWE   = mkProg(VS_FULL, SWE_FRAG);
+const uSWE   = U(pSWE, 'u_hf','u_res','u_worldSize','u_depth','u_gravity','u_dt','u_worldOrigin','u_damping','u_impC','u_impR','u_impS');
+
+const pClear = mkProg(VS_FULL, CLEAR_FRAG);
+
+const pDiag  = mkProg(VS_FULL, DIAG_FRAG);
+const uDiag  = U(pDiag, 'u_hf','u_res','u_worldSize','u_stride');
+
+const pOcean = mkProg(OCEAN_VS, OCEAN_FS);
+const uOcean = U(pOcean, 'u_hf','u_diag','u_proj','u_view','u_origin','u_size','u_hfRes',
+    'u_eye','u_sunDir','u_sunCol','u_deep','u_shallow','u_foamTh','u_foamInt','u_specPow','u_envR');
+
+const pDbg   = mkProg(VS_FULL, DBG_FRAG);
+const uDbg   = U(pDbg, 'u_tex','u_mode');
+
+// ═══════════════════════════════════════════════════════════════════
+// GROUP 2: HEIGHTFIELD STATE
+// ═══════════════════════════════════════════════════════════════════
+const hfPP = new PingPong(HF_RES, HF_RES, gl.LINEAR);
+
+// Diagnostics target (no ping-pong — write-once per frame)
+const diagTex = mkTex(HF_RES, HF_RES, gl.LINEAR);
+const diagFBO = mkFBO(diagTex);
+
+// Clear both ping-pong targets
+function clearHF() {
+    gl.useProgram(pClear);
+    gl.bindVertexArray(fsVAO);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, hfPP.fA);
+    gl.viewport(0,0,HF_RES,HF_RES);
+    gl.drawArrays(gl.TRIANGLES,0,3);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, hfPP.fB);
+    gl.drawArrays(gl.TRIANGLES,0,3);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+}
+clearHF();
+
+// CFL sub-step computation
+function computeSubSteps(totalDt) {
+    const dx = WORLD_SIZE / HF_RES;
+    const c = Math.sqrt(GRAV * DEPTH);
+    const dtMax = dx / (2 * c) * 0.9;
+    return Math.max(1, Math.ceil(totalDt / dtMax));
+}
+
+// Impulse queue
+let pendingImpulse = null;
+let subStepCount = 0;
+
+function updateHeightfield(dt) {
+    const cappedDt = Math.min(dt, 1/30);
+    const subs = computeSubSteps(cappedDt);
+    subStepCount = subs;
+    const subDt = cappedDt / subs;
+    const damping = Math.pow(DAMPING60, subDt * 60);
+
+    gl.useProgram(pSWE);
+    gl.uniform2f(uSWE.u_res, HF_RES, HF_RES);
+    gl.uniform1f(uSWE.u_worldSize, WORLD_SIZE);
+    gl.uniform1f(uSWE.u_depth, DEPTH);
+    gl.uniform1f(uSWE.u_gravity, GRAV);
+    gl.uniform2f(uSWE.u_worldOrigin, -HALF_WORLD, -HALF_WORLD);
+    gl.uniform1f(uSWE.u_damping, damping);
+    gl.uniform1f(uSWE.u_dt, subDt);
+
+    if (pendingImpulse) {
+        gl.uniform2f(uSWE.u_impC, pendingImpulse.cx, pendingImpulse.cz);
+        gl.uniform1f(uSWE.u_impR, pendingImpulse.radius);
+        gl.uniform1f(uSWE.u_impS, pendingImpulse.strength);
+    } else {
+        gl.uniform1f(uSWE.u_impS, 0);
+    }
+
+    for (let i = 0; i < subs; i++) {
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, hfPP.read);
+        gl.uniform1i(uSWE.u_hf, 0);
+        runFullscreen(pSWE, hfPP.wfbo, HF_RES, HF_RES);
+        hfPP.swap();
+
+        if (i === 0 && pendingImpulse) {
+            gl.uniform1f(uSWE.u_impS, 0);
+            pendingImpulse = null;
+        }
+    }
+}
+
+function updateDiagnostics() {
+    gl.useProgram(pDiag);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, hfPP.read);
+    gl.uniform1i(uDiag.u_hf, 0);
+    gl.uniform2f(uDiag.u_res, HF_RES, HF_RES);
+    gl.uniform1f(uDiag.u_worldSize, WORLD_SIZE);
+    gl.uniform1f(uDiag.u_stride, HF_RES >= 1024 ? 2.0 : 1.0);
+    runFullscreen(pDiag, diagFBO, HF_RES, HF_RES);
+}
+
+function addImpulse(cx, cz, radius, strength) {
+    pendingImpulse = { cx, cz, radius, strength };
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// GROUP 2: OCEAN MESH GEOMETRY
+// ═══════════════════════════════════════════════════════════════════
+const oceanVAO = gl.createVertexArray();
+gl.bindVertexArray(oceanVAO);
+
+const S = MESH_SEG;
+const vtxCount = (S+1)*(S+1);
+const uvData = new Float32Array(vtxCount * 2);
+for (let y = 0; y <= S; y++) {
+    for (let x = 0; x <= S; x++) {
+        const i = y*(S+1)+x;
+        uvData[i*2]   = x/S;
+        uvData[i*2+1] = y/S;
+    }
+}
+const uvBuf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, uvBuf);
+gl.bufferData(gl.ARRAY_BUFFER, uvData, gl.STATIC_DRAW);
+const aUV = gl.getAttribLocation(pOcean, 'a_uv');
+gl.enableVertexAttribArray(aUV);
+gl.vertexAttribPointer(aUV, 2, gl.FLOAT, false, 0, 0);
+
+const idxCount = S*S*6;
+const idxData = new Uint32Array(idxCount);
+let idx = 0;
+for (let y = 0; y < S; y++) {
+    for (let x = 0; x < S; x++) {
+        const i = y*(S+1)+x;
+        idxData[idx++]=i; idxData[idx++]=i+1; idxData[idx++]=i+S+2;
+        idxData[idx++]=i; idxData[idx++]=i+S+2; idxData[idx++]=i+S+1;
+    }
+}
+const idxBuf = gl.createBuffer();
+gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxBuf);
+gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, idxData, gl.STATIC_DRAW);
+gl.bindVertexArray(null);
+
+// ═══════════════════════════════════════════════════════════════════
+// CAMERA (Orbit Controls)
+// ═══════════════════════════════════════════════════════════════════
+let camTheta = 0.3, camPhi = 0.55, camDist = 80;
+let camTarget = [0, 0, 0];
+let projMat = M4.create(), viewMat = M4.create();
+let eye = [0,0,0];
+let wireframe = false;
+let debugMode = 0;
+
+function updateCamera() {
+    const ct = Math.cos(camTheta), st = Math.sin(camTheta);
+    const cp = Math.cos(camPhi), sp = Math.sin(camPhi);
+    eye[0] = camTarget[0] + camDist * cp * st;
+    eye[1] = camTarget[1] + camDist * sp;
+    eye[2] = camTarget[2] + camDist * cp * ct;
+    M4.perspective(projMat, Math.PI/3, W/H, 0.5, 2000);
+    M4.lookAt(viewMat, eye, camTarget, [0,1,0]);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// INPUT HANDLING
+// ═══════════════════════════════════════════════════════════════════
+let dragging = false, lastMX = 0, lastMY = 0;
+
+canvas.addEventListener('mousedown', e => {
+    if (e.button === 0) { dragging = true; lastMX = e.clientX; lastMY = e.clientY; }
+});
+window.addEventListener('mouseup', () => { dragging = false; });
+window.addEventListener('mousemove', e => {
+    if (!dragging) return;
+    const dx = e.clientX - lastMX, dy = e.clientY - lastMY;
+    camTheta -= dx * 0.005;
+    camPhi = Math.max(0.05, Math.min(Math.PI/2 - 0.01, camPhi + dy * 0.005));
+    lastMX = e.clientX; lastMY = e.clientY;
+});
+canvas.addEventListener('wheel', e => {
+    e.preventDefault();
+    camDist = Math.max(10, Math.min(300, camDist * (1 + e.deltaY * 0.001)));
+}, { passive: false });
+
+// Click to add impulse (raycast to y=0 plane)
+canvas.addEventListener('click', e => {
+    if (Math.abs(e.clientX - lastMX) > 5 || Math.abs(e.clientY - lastMY) > 5) return;
+    const nx = (e.clientX / W) * 2 - 1;
+    const ny = 1 - (e.clientY / H) * 2;
+
+    const invProj = M4.create(), invView = M4.create();
+    M4.invert(invProj, projMat);
+    M4.invert(invView, viewMat);
+    const invVP = M4.create();
+    M4.mul(invVP, invView, invProj);
+
+    // Near point (NDC z=-1)
+    const nw = 1;
+    const cx = invVP[0]*nx + invVP[4]*ny + invVP[8]*(-1) + invVP[12]*nw;
+    const cy = invVP[1]*nx + invVP[5]*ny + invVP[9]*(-1) + invVP[13]*nw;
+    const cz = invVP[2]*nx + invVP[6]*ny + invVP[10]*(-1) + invVP[14]*nw;
+    const cw = invVP[3]*nx + invVP[7]*ny + invVP[11]*(-1) + invVP[15]*nw;
+    const nearPt = [cx/cw, cy/cw, cz/cw];
+    // Far point (NDC z=1)
+    const fx = invVP[0]*nx + invVP[4]*ny + invVP[8]*(1) + invVP[12]*nw;
+    const fy = invVP[1]*nx + invVP[5]*ny + invVP[9]*(1) + invVP[13]*nw;
+    const fz = invVP[2]*nx + invVP[6]*ny + invVP[10]*(1) + invVP[14]*nw;
+    const fw = invVP[3]*nx + invVP[7]*ny + invVP[11]*(1) + invVP[15]*nw;
+    const farPt = [fx/fw, fy/fw, fz/fw];
+
+    const dir = [farPt[0]-nearPt[0], farPt[1]-nearPt[1], farPt[2]-nearPt[2]];
+    if (Math.abs(dir[1]) < 1e-6) return;
+    const t = -nearPt[1] / dir[1];
+    if (t < 0) return;
+    const hitX = nearPt[0] + dir[0] * t;
+    const hitZ = nearPt[2] + dir[2] * t;
+
+    if (Math.abs(hitX) < HALF_WORLD && Math.abs(hitZ) < HALF_WORLD) {
+        addImpulse(hitX, hitZ, 4.0, 60.0);
+    }
+});
+
+window.addEventListener('keydown', e => {
+    const k = e.key.toLowerCase();
+    if (k >= '0' && k <= '4') { debugMode = parseInt(k); }
+    else if (k === 'r') { clearHF(); }
+    else if (k === 'w') { wireframe = !wireframe; }
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// INITIAL IMPULSES (so the demo looks alive immediately)
+// ═══════════════════════════════════════════════════════════════════
+const initImpulses = [
+    { cx: 0, cz: 0, radius: 6, strength: 80, frame: 2 },
+    { cx: 40, cz: -30, radius: 4, strength: 50, frame: 30 },
+    { cx: -35, cz: 25, radius: 5, strength: 65, frame: 60 },
+    { cx: -20, cz: -40, radius: 3, strength: 45, frame: 100 },
+];
+
+// ═══════════════════════════════════════════════════════════════════
+// RENDER OCEAN
+// ═══════════════════════════════════════════════════════════════════
+const sunDir = [0.5, 0.8, 0.3];
+const sl = 1/Math.sqrt(sunDir[0]**2+sunDir[1]**2+sunDir[2]**2);
+sunDir[0]*=sl; sunDir[1]*=sl; sunDir[2]*=sl;
+
+function renderOcean() {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, W, H);
+    gl.clearColor(0.06, 0.08, 0.14, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    gl.enable(gl.DEPTH_TEST);
+    gl.depthFunc(gl.LESS);
+
+    gl.useProgram(pOcean);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, hfPP.read);
+    gl.uniform1i(uOcean.u_hf, 0);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, diagTex);
+    gl.uniform1i(uOcean.u_diag, 1);
+
+    gl.uniformMatrix4fv(uOcean.u_proj, false, projMat);
+    gl.uniformMatrix4fv(uOcean.u_view, false, viewMat);
+    gl.uniform2f(uOcean.u_origin, -HALF_WORLD, -HALF_WORLD);
+    gl.uniform1f(uOcean.u_size, WORLD_SIZE);
+    gl.uniform2f(uOcean.u_hfRes, HF_RES, HF_RES);
+    gl.uniform3f(uOcean.u_eye, eye[0], eye[1], eye[2]);
+    gl.uniform3f(uOcean.u_sunDir, sunDir[0], sunDir[1], sunDir[2]);
+    gl.uniform3f(uOcean.u_sunCol, 1.2, 1.1, 1.0);
+    gl.uniform3f(uOcean.u_deep, 0.01, 0.04, 0.12);
+    gl.uniform3f(uOcean.u_shallow, 0.04, 0.16, 0.30);
+    gl.uniform1f(uOcean.u_foamTh, FOAM_THRESH);
+    gl.uniform1f(uOcean.u_foamInt, FOAM_INT);
+    gl.uniform1f(uOcean.u_specPow, SPEC_POW);
+    gl.uniform1f(uOcean.u_envR, ENV_REFL);
+
+    gl.bindVertexArray(oceanVAO);
+    if (wireframe) {
+        for (let i = 0; i < idxCount; i += 3) {
+            gl.drawElements(gl.LINE_LOOP, 3, gl.UNSIGNED_INT, i * 4);
+        }
+    } else {
+        gl.drawElements(gl.TRIANGLES, idxCount, gl.UNSIGNED_INT, 0);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// RENDER DEBUG OVERLAY
+// ═══════════════════════════════════════════════════════════════════
+function renderDebug() {
+    if (debugMode === 0) return;
+    gl.disable(gl.DEPTH_TEST);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+    gl.useProgram(pDbg);
+    gl.activeTexture(gl.TEXTURE0);
+    if (debugMode === 1) {
+        gl.bindTexture(gl.TEXTURE_2D, hfPP.read);
+    } else {
+        gl.bindTexture(gl.TEXTURE_2D, diagTex);
+    }
+    gl.uniform1i(uDbg.u_tex, 0);
+    gl.uniform1i(uDbg.u_mode, debugMode);
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, W, H);
+    gl.bindVertexArray(fsVAO);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+    gl.disable(gl.BLEND);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// PERFORMANCE TRACKING
+// ═══════════════════════════════════════════════════════════════════
+let fps = 0, frameTime = 0;
+let fpsAccum = 0, fpsCount = 0;
+const hudEl = document.getElementById('hud');
+const modeEl = document.getElementById('mode');
+
+const modeNames = ['OFF', 'Height η', 'Steepness |∇η|', 'Curvature ∇²η', 'Jacobian J'];
+const modeColors = ['', '#4af', '#fa4', '#48f', '#4f8'];
+
+function updateHUD() {
+    const waveSpeed = Math.sqrt(GRAV * DEPTH).toFixed(1);
+    hudEl.innerHTML =
+        `<span class="label">FPS:</span> <span class="val">${fps}</span>  ` +
+        `<span class="label">Frame:</span> <span class="val">${frameTime.toFixed(1)}ms</span><br>` +
+        `<span class="label">Sub-steps:</span> <span class="val">${subStepCount}</span>  ` +
+        `<span class="label">c=√(gH):</span> <span class="val">${waveSpeed} m/s</span><br>` +
+        `<span class="label">HF:</span> <span class="val">${HF_RES}²</span>  ` +
+        `<span class="label">Mesh:</span> <span class="val">${MESH_SEG}²</span>  ` +
+        `<span class="label">World:</span> <span class="val">${WORLD_SIZE}m</span>`;
+    if (debugMode > 0) {
+        modeEl.innerHTML = `<span style="color:${modeColors[debugMode]}">DEBUG [${debugMode}]: ${modeNames[debugMode]}</span>`;
+    } else {
+        modeEl.innerHTML = '';
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// MAIN LOOP
+// ═══════════════════════════════════════════════════════════════════
+let lastTime = 0, frameNum = 0;
+
+function loop(now) {
+    requestAnimationFrame(loop);
+    const t0 = performance.now();
+
+    if (W !== innerWidth || H !== innerHeight) {
+        resize();
+    }
+
+    const dt = lastTime ? Math.min((now - lastTime) / 1000, 0.05) : 1/60;
+    lastTime = now;
+
+    // Fire initial impulses
+    for (const imp of initImpulses) {
+        if (frameNum === imp.frame) {
+            addImpulse(imp.cx, imp.cz, imp.radius, imp.strength);
+        }
+    }
+
+    // Update camera
+    updateCamera();
+
+    // Pass 1: SWE heightfield update
+    updateHeightfield(dt);
+
+    // Pass 2: Diagnostics
+    updateDiagnostics();
+
+    // Pass 16 (partial): Render ocean
+    renderOcean();
+
+    // Debug overlay
+    renderDebug();
+
+    // Performance
+    const t1 = performance.now();
+    frameTime = t1 - t0;
+    fpsAccum += dt;
+    fpsCount++;
+    if (fpsAccum >= 0.5) {
+        fps = Math.round(fpsCount / fpsAccum);
+        fpsAccum = 0; fpsCount = 0;
+        updateHUD();
+    }
+    frameNum++;
+}
+
+updateHUD();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>

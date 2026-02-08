@@ -1,0 +1,818 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OPUS Water Engine — Groups 1–4</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#000;overflow:hidden;font-family:'Courier New',monospace;color:#0f0}
+canvas{display:block;width:100vw;height:100vh}
+#hud{position:fixed;top:10px;left:10px;font-size:11px;pointer-events:none;text-shadow:0 0 3px #000;z-index:10;line-height:1.5}
+#controls{position:fixed;bottom:10px;left:10px;font-size:10px;pointer-events:none;text-shadow:0 0 3px #000;z-index:10;opacity:.7;line-height:1.4}
+#gates{position:fixed;top:10px;right:10px;font-size:10px;text-shadow:0 0 3px #000;z-index:10;text-align:right;pointer-events:none;line-height:1.5}
+.pass{color:#0f0}.fail{color:#f44}.pend{color:#ff0}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud"></div>
+<div id="controls">
+[Click] Wave impulse &nbsp; [Shift+Click] Place hull<br>
+[H] Toggle hull &nbsp; [R] Reset sheet<br>
+[Drag] Orbit &nbsp; [Scroll] Zoom<br>
+[0] Perf [1] Height [2] Steepness [3] Jacobian<br>
+[4] SheetY [5] Velocity [6] LinkHealth [7] Pressure<br>
+[8] Thickness [9] Hull &nbsp; [Space] No overlay
+</div>
+<div id="gates"></div>
+<script>
+"use strict";
+// ═══════════════════════════════════════════════════════════════
+// OPUS WATER ENGINE — Groups 1-4 Complete Implementation
+// Orchestration_2026-02-08-artifact.md is the single source of truth
+// ═══════════════════════════════════════════════════════════════
+
+const HF_RES = 512, HF_WORLD = 200.0, HF_DEPTH = 20.0, HF_G = 9.81, HF_DAMP = 0.995;
+const SH_RES = 128, SH_WORLD = 50.0;
+const HULL_R = 4.0;
+
+// ─── WebGL2 Setup ────────────────────────────────────────────
+const canvas = document.getElementById('c');
+canvas.width = window.innerWidth; canvas.height = window.innerHeight;
+const gl = canvas.getContext('webgl2', {antialias:false, alpha:false});
+if(!gl){document.body.innerHTML='<h1 style="color:red;padding:40px">WebGL2 required</h1>';throw 'no gl';}
+gl.getExtension('EXT_color_buffer_float');
+gl.getExtension('EXT_color_buffer_half_float');
+gl.getExtension('OES_texture_float_linear');
+gl.getExtension('OES_texture_half_float_linear');
+
+window.addEventListener('resize',()=>{canvas.width=innerWidth;canvas.height=innerHeight;});
+
+// ─── Shader Compile ──────────────────────────────────────────
+function compileShader(src,type){
+  const s=gl.createShader(type);gl.shaderSource(s,src);gl.compileShader(s);
+  if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)){console.error(gl.getShaderInfoLog(s),src);gl.deleteShader(s);return null;}
+  return s;
+}
+function createProgram(vs,fs){
+  const p=gl.createProgram();
+  const v=compileShader(vs,gl.VERTEX_SHADER), f=compileShader(fs,gl.FRAGMENT_SHADER);
+  if(!v||!f)return null;
+  gl.attachShader(p,v);gl.attachShader(p,f);gl.linkProgram(p);
+  if(!gl.getProgramParameter(p,gl.LINK_STATUS)){console.error(gl.getProgramInfoLog(p));return null;}
+  // cache uniform locations
+  const n=gl.getProgramParameter(p,gl.ACTIVE_UNIFORMS);
+  p._u={};for(let i=0;i<n;i++){const info=gl.getActiveUniform(p,i);p._u[info.name]=gl.getUniformLocation(p,info.name);}
+  return p;
+}
+function U(prog,name){return prog._u[name]||null;}
+
+// ─── Fullscreen Quad ─────────────────────────────────────────
+const fsVAO=gl.createVertexArray();
+gl.bindVertexArray(fsVAO);
+const fsVBO=gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER,fsVBO);
+gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,0,0, 1,-1,1,0, -1,1,0,1, 1,1,1,1]),gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0);gl.vertexAttribPointer(0,2,gl.FLOAT,false,16,0);
+gl.enableVertexAttribArray(1);gl.vertexAttribPointer(1,2,gl.FLOAT,false,16,8);
+gl.bindVertexArray(null);
+
+const FS_VERT=`#version 300 es
+layout(location=0)in vec2 a_pos;layout(location=1)in vec2 a_uv;
+out vec2 v_uv;void main(){v_uv=a_uv;gl_Position=vec4(a_pos,0,1);}`;
+
+function drawQuad(){gl.bindVertexArray(fsVAO);gl.drawArrays(gl.TRIANGLE_STRIP,0,4);}
+
+// ─── Texture & Framebuffer Helpers ───────────────────────────
+function createTex(w,h,filter){
+  const t=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,t);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA16F,w,h,0,gl.RGBA,gl.HALF_FLOAT,null);
+  const f=filter||gl.NEAREST;
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,f);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,f);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+  return t;
+}
+function createFB(tex){
+  const fb=gl.createFramebuffer();gl.bindFramebuffer(gl.FRAMEBUFFER,fb);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,tex,0);
+  return fb;
+}
+function createPP(w,h,filter){
+  const a=createTex(w,h,filter),b=createTex(w,h,filter);
+  const fa=createFB(a),fb_=createFB(b);
+  return {texs:[a,b],fbs:[fa,fb_],idx:0,
+    get read(){return this.texs[this.idx];},
+    get write(){return this.texs[1-this.idx];},
+    get readFB(){return this.fbs[this.idx];},
+    get writeFB(){return this.fbs[1-this.idx];},
+    swap(){this.idx=1-this.idx;}
+  };
+}
+function bindTex(unit,tex){gl.activeTexture(gl.TEXTURE0+unit);gl.bindTexture(gl.TEXTURE_2D,tex);}
+
+function renderPass(prog,fb,w,h,texBindings,uniforms){
+  gl.bindFramebuffer(gl.FRAMEBUFFER,fb);
+  gl.viewport(0,0,w,h);
+  gl.useProgram(prog);
+  if(texBindings)for(const[unit,tex,name]of texBindings){bindTex(unit,tex);gl.uniform1i(U(prog,name),unit);}
+  if(uniforms)for(const[name,...args]of uniforms){
+    const loc=U(prog,name);if(!loc)continue;
+    if(args.length===1)gl.uniform1f(loc,args[0]);
+    else if(args.length===2)gl.uniform2f(loc,args[0],args[1]);
+    else if(args.length===3)gl.uniform3f(loc,args[0],args[1],args[2]);
+    else if(args.length===4)gl.uniform4f(loc,args[0],args[1],args[2],args[3]);
+  }
+  drawQuad();
+}
+
+// ─── Matrix Math ─────────────────────────────────────────────
+function mat4Perspective(fov,aspect,near,far){
+  const f=1/Math.tan(fov/2),nf=1/(near-far);
+  return new Float32Array([f/aspect,0,0,0, 0,f,0,0, 0,0,(far+near)*nf,-1, 0,0,2*far*near*nf,0]);
+}
+function mat4LookAt(eye,center,up){
+  let zx=eye[0]-center[0],zy=eye[1]-center[1],zz=eye[2]-center[2];
+  let l=1/Math.sqrt(zx*zx+zy*zy+zz*zz);zx*=l;zy*=l;zz*=l;
+  let xx=up[1]*zz-up[2]*zy,xy=up[2]*zx-up[0]*zz,xz=up[0]*zy-up[1]*zx;
+  l=1/Math.sqrt(xx*xx+xy*xy+xz*xz);xx*=l;xy*=l;xz*=l;
+  let yx=zy*xz-zz*xy,yy=zz*xx-zx*xz,yz=zx*xy-zy*xx;
+  return new Float32Array([xx,yx,zx,0, xy,yy,zy,0, xz,yz,zz,0,
+    -(xx*eye[0]+xy*eye[1]+xz*eye[2]),-(yx*eye[0]+yy*eye[1]+yz*eye[2]),-(zx*eye[0]+zy*eye[1]+zz*eye[2]),1]);
+}
+function mat4Mul(a,b){
+  const o=new Float32Array(16);
+  for(let i=0;i<4;i++)for(let j=0;j<4;j++){let s=0;for(let k=0;k<4;k++)s+=a[k*4+j]*b[i*4+k];o[i*4+j]=s;}
+  return o;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// SHADER SOURCES
+// ═══════════════════════════════════════════════════════════════
+
+// ─── Pass 1: SWE Heightfield Update ─────────────────────────
+const SWE_FRAG=`#version 300 es
+precision highp float;precision highp sampler2D;
+uniform sampler2D u_hf;
+uniform vec2 u_res;uniform float u_world,u_depth,u_grav,u_dt,u_damp;
+uniform vec2 u_impulseC;uniform float u_impulseR,u_impulseS;
+in vec2 v_uv;out vec4 fc;
+void main(){
+  vec2 tx=1./u_res;float dx=u_world/u_res.x;
+  vec4 C=texture(u_hf,v_uv),L=texture(u_hf,v_uv+vec2(-tx.x,0)),R=texture(u_hf,v_uv+vec2(tx.x,0)),
+       D=texture(u_hf,v_uv+vec2(0,-tx.y)),Up=texture(u_hf,v_uv+vec2(0,tx.y));
+  float ea=.25*(L.r+R.r+D.r+Up.r),ua=.25*(L.b+R.b+D.b+Up.b),va=.25*(L.a+R.a+D.a+Up.a);
+  float dudx=(R.b-L.b)/(2.*dx),dvdz=(Up.a-D.a)/(2.*dx);
+  float er=-u_depth*(dudx+dvdz);
+  float dedx=(R.r-L.r)/(2.*dx),dedz=(Up.r-D.r)/(2.*dx);
+  float ne=ea+er*u_dt,nu=ua-u_grav*dedx*u_dt,nv=va-u_grav*dedz*u_dt;
+  vec2 wo=v_uv*u_world-u_world*.5;vec2 lp=v_uv*u_world;float sw=u_world*.05;
+  float sp=smoothstep(0.,sw,lp.x)*smoothstep(0.,sw,u_world-lp.x)*smoothstep(0.,sw,lp.y)*smoothstep(0.,sw,u_world-lp.y);
+  ne*=sp*u_damp;nu*=sp*u_damp;nv*=sp*u_damp;
+  if(u_impulseS!=0.){vec2 d=wo-u_impulseC;ne+=u_impulseS*exp(-dot(d,d)/(u_impulseR*u_impulseR))*u_dt;}
+  float ero=(ne-C.r)/max(u_dt,1e-6);
+  fc=vec4(ne,ero,nu,nv);
+}`;
+
+// ─── Pass 2: Diagnostics ────────────────────────────────────
+const DIAG_FRAG=`#version 300 es
+precision highp float;precision highp sampler2D;
+uniform sampler2D u_hf;uniform vec2 u_res;uniform float u_world,u_stride;
+in vec2 v_uv;out vec4 fc;
+void main(){
+  vec2 tx=1./u_res;vec2 st=tx*u_stride;float dx=u_world/u_res.x;float de=dx*u_stride;
+  float C=texture(u_hf,v_uv).r,L=texture(u_hf,v_uv+vec2(-st.x,0)).r,R=texture(u_hf,v_uv+vec2(st.x,0)).r,
+        D=texture(u_hf,v_uv+vec2(0,-st.y)).r,Up=texture(u_hf,v_uv+vec2(0,st.y)).r;
+  float gx=(R-L)/(2.*de),gz=(Up-D)/(2.*de);
+  float steep=sqrt(gx*gx+gz*gz);
+  float curv=(L+R+D+Up-4.*C)/(de*de);
+  float jac=1.-steep*steep-abs(curv)*de;
+  float er=texture(u_hf,v_uv).g;
+  fc=vec4(steep,curv,jac,er);
+}`;
+
+// ─── Clear shader ───────────────────────────────────────────
+const CLEAR_FRAG=`#version 300 es
+precision highp float;uniform vec4 u_val;out vec4 fc;void main(){fc=u_val;}`;
+
+// ─── Sheet Init Position ────────────────────────────────────
+const SHEET_INIT_POS_FRAG=`#version 300 es
+precision highp float;precision highp sampler2D;
+uniform sampler2D u_hf;
+uniform vec2 u_shOrig,u_shSize,u_hfOrig,u_hfSize;
+in vec2 v_uv;out vec4 fc;
+void main(){
+  vec2 wXZ=u_shOrig+v_uv*u_shSize;
+  vec2 hfUV=clamp((wXZ-u_hfOrig)/u_hfSize,.001,.999);
+  float eta=texture(u_hf,hfUV).r;
+  fc=vec4(wXZ.x,eta,wXZ.y,1.);
+}`;
+
+// ─── Pass 3: Hull Contact (analytic sphere) ─────────────────
+const HULL_FRAG=`#version 300 es
+precision highp float;
+uniform vec2 u_shOrig,u_shSize;
+uniform vec3 u_hullPos,u_hullVel;uniform float u_hullR;uniform float u_active;
+in vec2 v_uv;out vec4 fc;
+void main(){
+  if(u_active<.5){fc=vec4(0);return;}
+  vec2 wXZ=u_shOrig+v_uv*u_shSize;
+  vec2 d=wXZ-u_hullPos.xz;float dist=length(d);
+  if(dist>=u_hullR){fc=vec4(0);return;}
+  float hy=u_hullPos.y-sqrt(max(0.,u_hullR*u_hullR-dist*dist));
+  vec3 hn=normalize(vec3(d.x,sqrt(max(.001,u_hullR*u_hullR-dist*dist)),d.y));
+  vec3 up=vec3(0,1,0);vec3 asc=normalize(up-hn*dot(up,hn)+vec3(.0001));
+  float aa=atan(asc.z,asc.x)/6.2832+.5;
+  vec3 vd=normalize(u_hullVel+vec3(.0001));
+  float fi=max(0.,-dot(normalize(vec3(hn.x,0,hn.z)),vd));
+  float spd=length(u_hullVel);
+  fc=vec4(hy,aa,fi,max(spd,.001));
+}`;
+
+// ─── Pass 4: Sheet Pressure ─────────────────────────────────
+const PRESSURE_FRAG=`#version 300 es
+precision highp float;precision highp sampler2D;
+uniform sampler2D u_pos,u_hf,u_diag;
+uniform vec2 u_shOrig,u_shSize,u_hfOrig,u_hfSize;
+uniform float u_pStiff,u_waveBoost;
+in vec2 v_uv;out vec4 fc;
+const float ATM=101325.,RHO=1000.,G=9.81;
+void main(){
+  vec4 p=texture(u_pos,v_uv);
+  if(p.w<.001){fc=vec4(ATM,ATM,0,0);return;}
+  vec2 hfUV=clamp((p.xz-u_hfOrig)/u_hfSize,.001,.999);
+  float eta=texture(u_hf,hfUV).r;float depth=eta-p.y;
+  vec4 dg=texture(u_diag,hfUV);float er=dg.a;
+  float Pb;
+  if(depth>0.)Pb=ATM+RHO*G*depth;
+  else Pb=ATM-u_pStiff*abs(depth)*exp(-abs(depth)*2.);
+  Pb+=max(er,0.)*u_waveBoost*RHO;
+  fc=vec4(Pb,ATM,0,0);
+}`;
+
+// ─── Pass 5: Link Update — ★ THE SEAM ENGINE ★ ─────────────
+const LINK_FRAG=`#version 300 es
+precision highp float;precision highp sampler2D;
+uniform sampler2D u_link,u_hull,u_pos,u_vel,u_hf,u_diag;
+uniform vec2 u_shRes,u_shOrig,u_shSize,u_hfOrig,u_hfSize;
+uniform float u_dt,u_breakRate,u_healRate,u_ascTh,u_healProx,u_strainTh,u_waveBreakR,u_restEdge;
+in vec2 v_uv;out vec4 fc;
+void main(){
+  vec2 tx=1./u_shRes;vec2 link=texture(u_link,v_uv).rg;
+  vec2 uvPX=v_uv+vec2(tx.x,0),uvPY=v_uv+vec2(0,tx.y);
+  vec4 hH=texture(u_hull,v_uv),hPX=texture(u_hull,uvPX),hPY=texture(u_hull,uvPY);
+  bool bH=hH.a>.0,bPX=hPX.a>.0,bPY=hPY.a>.0;
+  vec4 pH=texture(u_pos,v_uv),pPX=texture(u_pos,uvPX),pPY=texture(u_pos,uvPY);
+  vec3 vH=texture(u_vel,v_uv).xyz;
+  // HF equilibrium
+  vec2 hfH=clamp((pH.xz-u_hfOrig)/u_hfSize,.001,.999);
+  vec2 hfPX=clamp((pPX.xz-u_hfOrig)/u_hfSize,.001,.999);
+  vec2 hfPY=clamp((pPY.xz-u_hfOrig)/u_hfSize,.001,.999);
+  float eqH=texture(u_hf,hfH).r,eqPX=texture(u_hf,hfPX).r,eqPY=texture(u_hf,hfPY).r;
+  // Diagnostics for autonomous breaking
+  vec4 dgH=texture(u_diag,hfH);
+  float steep=dgH.r,jac=dgH.b;
+  // ─── LINK U (+X) ───
+  float lU=link.r;float brkU=0.;
+  if(bH!=bPX)brkU+=1.;
+  if(bH&&bPX){vec2 aH=hH.gb*2.-1.,aPX=hPX.gb*2.-1.;float ag=dot(normalize(aH+vec2(.0001)),normalize(aPX+vec2(.0001)));if(ag<u_ascTh)brkU+=1.-ag;}
+  if(bH){float pen=hH.r-pH.y;if(pen>.3)brkU+=pen*hH.b;}
+  float edU=distance(pH.xyz,pPX.xyz),strU=edU/u_restEdge;
+  if(strU>u_strainTh)brkU+=(strU-u_strainTh);
+  // Wave breaking
+  if(steep>0.5&&jac<0.2)brkU+=u_waveBreakR*steep;
+  lU-=brkU*u_breakRate*u_dt;
+  if(brkU<.01){
+    bool noH=!bH&&!bPX;
+    bool clH=abs(pH.y-eqH)<u_healProx&&abs(pPX.y-eqPX)<u_healProx;
+    bool slw=length(vH)<.5;
+    if(noH&&clH&&slw&&strU<1.5)lU+=u_healRate*u_dt;
+  }
+  // ─── LINK V (+Y) ───
+  float lV=link.g;float brkV=0.;
+  if(bH!=bPY)brkV+=1.;
+  if(bH&&bPY){vec2 aH=hH.gb*2.-1.,aPY=hPY.gb*2.-1.;float ag=dot(normalize(aH+vec2(.0001)),normalize(aPY+vec2(.0001)));if(ag<u_ascTh)brkV+=1.-ag;}
+  if(bH){float pen=hH.r-pH.y;if(pen>.3)brkV+=pen*hH.b;}
+  float edV=distance(pH.xyz,pPY.xyz),strV=edV/u_restEdge;
+  if(strV>u_strainTh)brkV+=(strV-u_strainTh);
+  if(steep>0.5&&jac<0.2)brkV+=u_waveBreakR*steep;
+  lV-=brkV*u_breakRate*u_dt;
+  if(brkV<.01){
+    bool noH=!bH&&!bPY;
+    bool clH=abs(pH.y-eqH)<u_healProx&&abs(pPY.y-eqPY)<u_healProx;
+    bool slw=length(vH)<.5;
+    if(noH&&clH&&slw&&strV<1.5)lV+=u_healRate*u_dt;
+  }
+  // Border fade
+  float bd=min(min(v_uv.x,1.-v_uv.x),min(v_uv.y,1.-v_uv.y));
+  float bf=smoothstep(0.,.04,bd);
+  lU*=bf;lV*=bf;
+  fc=vec4(clamp(lU,0.,1.),clamp(lV,0.,1.),0,0);
+}`;
+
+// ─── Pass 6: Viscosity Diffuse ──────────────────────────────
+const VISC_FRAG=`#version 300 es
+precision highp float;precision highp sampler2D;
+uniform sampler2D u_vel,u_link;
+uniform vec2 u_shRes;uniform float u_visc;
+in vec2 v_uv;out vec4 fc;
+void main(){
+  vec2 tx=1./u_shRes;vec4 vc=texture(u_vel,v_uv);vec3 v=vc.xyz;
+  vec2 lH=texture(u_link,v_uv).rg;
+  float lNX=texture(u_link,v_uv-vec2(tx.x,0)).r;
+  float lNY=texture(u_link,v_uv-vec2(0,tx.y)).g;
+  vec3 vPX=texture(u_vel,v_uv+vec2(tx.x,0)).xyz;
+  vec3 vNX=texture(u_vel,v_uv-vec2(tx.x,0)).xyz;
+  vec3 vPY=texture(u_vel,v_uv+vec2(0,tx.y)).xyz;
+  vec3 vNY=texture(u_vel,v_uv-vec2(0,tx.y)).xyz;
+  vec3 diff=lH.r*(vPX-v)+lNX*(vNX-v)+lH.g*(vPY-v)+lNY*(vNY-v);
+  v+=u_visc*diff;
+  fc=vec4(v,vc.w);
+}`;
+
+// ─── Pass 7: Force Integrate (MRT: pos+vel) ─────────────────
+const INTEGRATE_FRAG=`#version 300 es
+precision highp float;precision highp sampler2D;
+uniform sampler2D u_pos,u_vel,u_press,u_norm,u_thick,u_hull,u_hf;
+uniform vec2 u_shRes,u_shOrig,u_shSize,u_hfOrig,u_hfSize;
+uniform float u_dt,u_gravY,u_hullStiff,u_hfCoup,u_damp;
+layout(location=0)out vec4 o_pos;layout(location=1)out vec4 o_vel;
+in vec2 v_uv;
+void main(){
+  vec4 pos=texture(u_pos,v_uv),vel=texture(u_vel,v_uv);
+  vec2 P=texture(u_press,v_uv).rg;vec3 nm=texture(u_norm,v_uv).xyz;
+  float th=texture(u_thick,v_uv).r;vec4 hull=texture(u_hull,v_uv);
+  float mass=pos.w;
+  if(mass<.001){o_pos=pos;o_vel=vel;return;}
+  float cs=u_shSize.x/u_shRes.x;float area=cs*cs;
+  vec3 F=vec3(0);
+  F.y+=u_gravY*mass;
+  float dP=P.r-P.g;vec3 sn=normalize(nm+vec3(0,.001,0));
+  F+=sn*dP*area*th;
+  if(hull.a>.0){
+    float pen=hull.r-pos.y;
+    if(pen>.0){
+      F.y-=pen*u_hullStiff*mass;
+      float aa=hull.g*6.2832-3.1416;vec2 ad=vec2(cos(aa),sin(aa));
+      float fi=hull.b;float tm=pen*u_hullStiff*.3*(1.+fi);
+      F.xz+=ad*tm*mass;
+    }
+  }
+  vec2 hfUV=clamp((pos.xz-u_hfOrig)/u_hfSize,.001,.999);
+  vec2 hfV=texture(u_hf,hfUV).ba;
+  F.xz+=(hfV-vel.xz)*u_hfCoup*mass;
+  F-=vel.xyz*u_damp*mass;
+  // Border stiffness
+  float bd=min(min(v_uv.x,1.-v_uv.x),min(v_uv.y,1.-v_uv.y));
+  float bf=smoothstep(0.,.05,bd);
+  float bStiff=mix(50.,u_hfCoup,bf);
+  float eta=texture(u_hf,hfUV).r;
+  F.y+=(eta-pos.y)*bStiff*mass*(1.-bf);
+  F.xz+=(hfV-vel.xz)*bStiff*mass*(1.-bf);
+  // Symplectic Euler
+  vec3 nv=vel.xyz+(F/mass)*u_dt;
+  float spd=length(nv);if(spd>30.)nv*=30./spd;
+  vec3 np=pos.xyz+nv*u_dt;
+  float stress=abs(np.y-eta);
+  o_pos=vec4(np,mass);o_vel=vec4(nv,stress);
+}`;
+
+// ─── Pass 11: Normal Compute ────────────────────────────────
+const NORMALS_FRAG=`#version 300 es
+precision highp float;precision highp sampler2D;
+uniform sampler2D u_pos,u_link;uniform vec2 u_shRes;
+in vec2 v_uv;out vec4 fc;
+void main(){
+  vec2 tx=1./u_shRes;
+  vec3 pC=texture(u_pos,v_uv).xyz;
+  vec3 pPX=texture(u_pos,v_uv+vec2(tx.x,0)).xyz,pNX=texture(u_pos,v_uv-vec2(tx.x,0)).xyz;
+  vec3 pPY=texture(u_pos,v_uv+vec2(0,tx.y)).xyz,pNY=texture(u_pos,v_uv-vec2(0,tx.y)).xyz;
+  vec2 lH=texture(u_link,v_uv).rg;
+  float lNX=texture(u_link,v_uv-vec2(tx.x,0)).r,lNY=texture(u_link,v_uv-vec2(0,tx.y)).g;
+  float wPX=lH.r,wNX=lNX;vec3 tU;
+  if(wPX+wNX>.01)tU=normalize((pPX-pC)*wPX+(pC-pNX)*wNX);else tU=vec3(1,0,0);
+  float wPY=lH.g,wNY=lNY;vec3 tV;
+  if(wPY+wNY>.01)tV=normalize((pPY-pC)*wPY+(pC-pNY)*wNY);else tV=vec3(0,0,1);
+  vec3 n=normalize(cross(tV,tU));
+  fc=vec4(n,n.y>0.?1.:-1.);
+}`;
+
+// ─── 3D Ocean Rendering ─────────────────────────────────────
+const OCEAN_VERT=`#version 300 es
+precision highp float;precision highp sampler2D;
+uniform sampler2D u_hf,u_diag;uniform mat4 u_vp;
+uniform vec2 u_hfOrig;uniform float u_hfWorld;uniform vec2 u_hfRes;
+layout(location=0)in vec2 a_uv;
+out vec3 v_wp;out vec3 v_n;out float v_steep;out float v_eta;
+void main(){
+  vec2 wXZ=u_hfOrig+a_uv*u_hfWorld;float eta=texture(u_hf,a_uv).r;
+  float dx=u_hfWorld/u_hfRes.x;vec2 tx=1./u_hfRes;
+  float hL=texture(u_hf,a_uv+vec2(-tx.x,0)).r,hR=texture(u_hf,a_uv+vec2(tx.x,0)).r;
+  float hD=texture(u_hf,a_uv+vec2(0,-tx.y)).r,hU=texture(u_hf,a_uv+vec2(0,tx.y)).r;
+  vec3 n=normalize(vec3((hL-hR)/(2.*dx),1.,(hD-hU)/(2.*dx)));
+  v_steep=texture(u_diag,a_uv).r;v_eta=eta;
+  v_wp=vec3(wXZ.x,eta,wXZ.y);v_n=n;
+  gl_Position=u_vp*vec4(v_wp,1);
+}`;
+const OCEAN_FRAG=`#version 300 es
+precision highp float;
+uniform vec3 u_eye,u_sun;
+in vec3 v_wp,v_n;in float v_steep,v_eta;out vec4 fc;
+void main(){
+  vec3 N=normalize(v_n),V=normalize(u_eye-v_wp),L=normalize(u_sun),H=normalize(V+L);
+  float F0=.02;float ct=max(dot(N,V),0.);float F=F0+(1.-F0)*pow(1.-ct,5.);
+  float df=smoothstep(-2.,2.,v_eta);
+  vec3 base=mix(vec3(.01,.04,.12),vec3(.04,.16,.30),df);
+  float wrap=max((dot(N,L)+.3)/1.3,0.);vec3 diff=base*wrap*vec3(1.2,1.1,1.);
+  float sp=pow(max(dot(N,H),0.),256.);vec3 spec=vec3(1.2,1.1,1.)*sp*F;
+  vec3 R=reflect(-V,N);float sky=max(R.y,0.);
+  vec3 env=mix(vec3(.6,.7,.8),vec3(.2,.4,.8),sky)*F*.6;
+  float foam=smoothstep(.35,.5,v_steep)*.7;
+  vec3 c=mix(diff+spec+env,vec3(.85,.9,.95),foam);
+  fc=vec4(c,1);
+}`;
+
+// ─── 3D Sheet Rendering ─────────────────────────────────────
+const SHEET_VERT=`#version 300 es
+precision highp float;precision highp sampler2D;
+uniform sampler2D u_pos,u_link,u_norm;uniform mat4 u_vp;uniform vec2 u_shRes;
+layout(location=0)in vec2 a_tuv;
+out vec3 v_wp,v_n;out float v_lh;out float v_mass;
+void main(){
+  vec4 pd=texture(u_pos,a_tuv);v_wp=pd.xyz;v_mass=pd.w;
+  v_n=texture(u_norm,a_tuv).xyz;
+  vec2 tx=1./u_shRes;vec2 lH=texture(u_link,a_tuv).rg;
+  float lNX=texture(u_link,a_tuv-vec2(tx.x,0)).r,lNY=texture(u_link,a_tuv-vec2(0,tx.y)).g;
+  v_lh=(lH.r+lH.g+lNX+lNY)*.25;
+  gl_Position=u_vp*vec4(v_wp,1);
+}`;
+const SHEET_FRAG=`#version 300 es
+precision highp float;
+uniform vec3 u_eye;uniform int u_mode;
+in vec3 v_wp,v_n;in float v_lh,v_mass;out vec4 fc;
+void main(){
+  if(v_mass<.001)discard;
+  float a=smoothstep(.05,.3,v_lh)*smoothstep(.0,.15,v_mass);
+  vec3 c;
+  if(u_mode==6){// Link health
+    c=mix(vec3(1,0,0),vec3(0,1,0),v_lh);a=.7;
+  }else{
+    vec3 N=normalize(v_n),V=normalize(u_eye-v_wp);
+    float F0=.02;float ct=max(dot(N,V),0.);float F=F0+(1.-F0)*pow(1.-ct,5.);
+    c=mix(vec3(.02,.12,.2),vec3(.1,.3,.5),F);
+    c+=vec3(.8,.85,.9)*pow(max(dot(N,normalize(vec3(.5,.8,.3))),0.),64.)*.5;
+    a*=.5;
+  }
+  fc=vec4(c,a);
+}`;
+
+// ─── Debug Viz ──────────────────────────────────────────────
+const VIS_FRAG=`#version 300 es
+precision highp float;precision highp sampler2D;
+uniform sampler2D u_tex;uniform int u_mode;
+in vec2 v_uv;out vec4 fc;
+void main(){
+  vec4 d=texture(u_tex,v_uv);float v;vec3 c;
+  if(u_mode==1){v=d.r*2.;c=v>0.?mix(vec3(0,.3,0),vec3(1,0,0),min(v,1.)):mix(vec3(0,.3,0),vec3(0,0,1),min(-v,1.));}
+  else if(u_mode==2){v=d.r;c=mix(vec3(0),vec3(1,1,0),clamp(v/.5,0.,1.));if(v>.4)c=mix(c,vec3(1,0,0),(v-.4)/.3);}
+  else if(u_mode==3){v=d.b;c=v>0.?vec3(0,clamp(v,0.,1.),0):vec3(clamp(-v,0.,1.),0,0);}
+  else if(u_mode==4){v=d.r;c=v>0.?mix(vec3(0,.3,0),vec3(1,0,0),min(v/2.,1.)):mix(vec3(0,.3,0),vec3(0,0,1),min(-v/2.,1.));}
+  else if(u_mode==5){v=length(d.rgb);c=mix(vec3(0),vec3(0,1,1),clamp(v/5.,0.,1.));}
+  else if(u_mode==6){c=mix(vec3(1,0,0),vec3(0,1,0),d.r);c=mix(c,mix(vec3(1,0,0),vec3(0,1,0),d.g),.5);}
+  else if(u_mode==7){v=(d.r-d.g)/1000.;c=v>0.?vec3(0,0,clamp(v,0.,1.)):vec3(clamp(-v,0.,1.),0,0);}
+  else if(u_mode==8){v=d.r;c=mix(vec3(0,0,0),vec3(0,.3,1),clamp(v/.5,0.,1.));if(v>.5)c=mix(c,vec3(1),(v-.5)/1.5);}
+  else if(u_mode==9){c=d.a>.0?vec3(1):vec3(0);}
+  else{c=vec3(.5);}
+  fc=vec4(c,.5);
+}`;
+
+// ═══════════════════════════════════════════════════════════════
+// COMPILE SHADER PROGRAMS
+// ═══════════════════════════════════════════════════════════════
+const pSWE=createProgram(FS_VERT,SWE_FRAG);
+const pDiag=createProgram(FS_VERT,DIAG_FRAG);
+const pClear=createProgram(FS_VERT,CLEAR_FRAG);
+const pInitPos=createProgram(FS_VERT,SHEET_INIT_POS_FRAG);
+const pHull=createProgram(FS_VERT,HULL_FRAG);
+const pPress=createProgram(FS_VERT,PRESSURE_FRAG);
+const pLink=createProgram(FS_VERT,LINK_FRAG);
+const pVisc=createProgram(FS_VERT,VISC_FRAG);
+const pInteg=createProgram(FS_VERT,INTEGRATE_FRAG);
+const pNorm=createProgram(FS_VERT,NORMALS_FRAG);
+const pOceanV=createProgram(OCEAN_VERT,OCEAN_FRAG);
+const pSheet=createProgram(SHEET_VERT,SHEET_FRAG);
+const pVis=createProgram(FS_VERT,VIS_FRAG);
+
+// ═══════════════════════════════════════════════════════════════
+// CREATE TEXTURES & FRAMEBUFFERS
+// ═══════════════════════════════════════════════════════════════
+const hfPP=createPP(HF_RES,HF_RES,gl.LINEAR);
+const diagTex=createTex(HF_RES,HF_RES,gl.LINEAR),diagFB=createFB(diagTex);
+const posPP=createPP(SH_RES,SH_RES);
+const velPP=createPP(SH_RES,SH_RES);
+const linkPP=createPP(SH_RES,SH_RES);
+const thickPP=createPP(SH_RES,SH_RES);
+const normTex=createTex(SH_RES,SH_RES),normFB=createFB(normTex);
+const pressTex=createTex(SH_RES,SH_RES),pressFB=createFB(pressTex);
+const hullTex=createTex(SH_RES,SH_RES),hullFB=createFB(hullTex);
+// MRT framebuffer for pass 7
+const mrtFB=gl.createFramebuffer();
+
+// ═══════════════════════════════════════════════════════════════
+// CREATE MESHES
+// ═══════════════════════════════════════════════════════════════
+function buildGridMesh(res){
+  const v=new Float32Array(res*res*2),idx=[];
+  for(let y=0;y<res;y++)for(let x=0;x<res;x++){const i=(y*res+x)*2;v[i]=(x+.5)/res;v[i+1]=(y+.5)/res;}
+  for(let y=0;y<res-1;y++)for(let x=0;x<res-1;x++){
+    const i=y*res+x;idx.push(i,i+1,i+res+1,i,i+res+1,i+res);
+  }
+  const vao=gl.createVertexArray();gl.bindVertexArray(vao);
+  const vb=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,vb);gl.bufferData(gl.ARRAY_BUFFER,v,gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);gl.vertexAttribPointer(0,2,gl.FLOAT,false,0,0);
+  const ib=gl.createBuffer();gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,ib);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,new Uint32Array(idx),gl.STATIC_DRAW);
+  gl.bindVertexArray(null);
+  return {vao,count:idx.length};
+}
+const oceanMesh=buildGridMesh(256);
+const sheetMesh=buildGridMesh(SH_RES);
+
+// ═══════════════════════════════════════════════════════════════
+// CLEAR & INITIALIZE
+// ═══════════════════════════════════════════════════════════════
+function clearTex(fb,w,h,r,g,b,a){
+  gl.bindFramebuffer(gl.FRAMEBUFFER,fb);gl.viewport(0,0,w,h);
+  gl.useProgram(pClear);gl.uniform4f(U(pClear,'u_val'),r,g,b,a);drawQuad();
+}
+
+// Clear heightfield
+clearTex(hfPP.fbs[0],HF_RES,HF_RES,0,0,0,0);
+clearTex(hfPP.fbs[1],HF_RES,HF_RES,0,0,0,0);
+// Clear vel
+clearTex(velPP.fbs[0],SH_RES,SH_RES,0,0,0,0);
+clearTex(velPP.fbs[1],SH_RES,SH_RES,0,0,0,0);
+// Init link = all bonded
+clearTex(linkPP.fbs[0],SH_RES,SH_RES,1,1,0,0);
+clearTex(linkPP.fbs[1],SH_RES,SH_RES,1,1,0,0);
+// Init thickness
+clearTex(thickPP.fbs[0],SH_RES,SH_RES,.5,0,0,0);
+clearTex(thickPP.fbs[1],SH_RES,SH_RES,.5,0,0,0);
+// Init normals
+clearTex(normFB,SH_RES,SH_RES,0,1,0,1);
+// Init pressure
+clearTex(pressFB,SH_RES,SH_RES,101325,101325,0,0);
+// Init hull
+clearTex(hullFB,SH_RES,SH_RES,0,0,0,0);
+
+function initSheetPositions(){
+  // Init pos from heightfield
+  for(let t=0;t<2;t++){
+    gl.bindFramebuffer(gl.FRAMEBUFFER,posPP.fbs[t]);gl.viewport(0,0,SH_RES,SH_RES);
+    gl.useProgram(pInitPos);
+    bindTex(0,hfPP.read);gl.uniform1i(U(pInitPos,'u_hf'),0);
+    gl.uniform2f(U(pInitPos,'u_shOrig'),-SH_WORLD/2,-SH_WORLD/2);
+    gl.uniform2f(U(pInitPos,'u_shSize'),SH_WORLD,SH_WORLD);
+    gl.uniform2f(U(pInitPos,'u_hfOrig'),-HF_WORLD/2,-HF_WORLD/2);
+    gl.uniform2f(U(pInitPos,'u_hfSize'),HF_WORLD,HF_WORLD);
+    drawQuad();
+  }
+}
+initSheetPositions();
+
+// ═══════════════════════════════════════════════════════════════
+// STATE
+// ═══════════════════════════════════════════════════════════════
+let hullPos=[8,0,0],hullVel=[0,0,2],hullActive=true;
+let debugMode=6; // Start with link health view
+let time=0,lastTime=0,frameCount=0,fps=0,fpsTimer=0;
+let pendingImpulse=null;
+
+// Camera
+let camTheta=0.5,camPhi=0.7,camDist=35,camTarget=[0,0,0];
+let isDragging=false,lastMX=0,lastMY=0;
+
+// Initial impulse
+pendingImpulse={cx:0,cz:0,r:5,s:80};
+
+// ─── Input Handling ──────────────────────────────────────────
+canvas.addEventListener('mousedown',e=>{
+  if(e.button===0&&!e.shiftKey){isDragging=true;lastMX=e.clientX;lastMY=e.clientY;}
+});
+canvas.addEventListener('mousemove',e=>{
+  if(isDragging){
+    camTheta+=(e.clientX-lastMX)*.005;camPhi=Math.max(.1,Math.min(Math.PI/2-.01,camPhi-(e.clientY-lastMY)*.005));
+    lastMX=e.clientX;lastMY=e.clientY;
+  }
+});
+canvas.addEventListener('mouseup',e=>{isDragging=false;});
+canvas.addEventListener('wheel',e=>{camDist=Math.max(5,Math.min(200,camDist+e.deltaY*.05));e.preventDefault();},{passive:false});
+
+canvas.addEventListener('click',e=>{
+  if(e.shiftKey){
+    // Place hull
+    const nx=(e.clientX/canvas.width)*2-1, ny=1-(e.clientY/canvas.height)*2;
+    const eye=getCamPos();
+    const fwd=[camTarget[0]-eye[0],camTarget[1]-eye[1],camTarget[2]-eye[2]];
+    const l=Math.sqrt(fwd[0]*fwd[0]+fwd[1]*fwd[1]+fwd[2]*fwd[2]);
+    fwd[0]/=l;fwd[1]/=l;fwd[2]/=l;
+    // Simple ray-plane intersection at y=0
+    if(fwd[1]!==0){
+      const t=-eye[1]/fwd[1];
+      if(t>0){hullPos=[eye[0]+fwd[0]*t,0,eye[2]+fwd[2]*t];hullVel=[0,0,0];}
+    }
+  } else if(!isDragging){
+    // Wave impulse at approximate world position
+    const nx=(e.clientX/canvas.width)*2-1;
+    const nz=(e.clientY/canvas.height)*2-1;
+    const cx=nx*HF_WORLD*.3, cz=nz*HF_WORLD*.3;
+    pendingImpulse={cx,cz,r:4,s:60};
+  }
+});
+
+document.addEventListener('keydown',e=>{
+  const k=e.key.toLowerCase();
+  if(k>='0'&&k<='9')debugMode=parseInt(k);
+  else if(k===' '){debugMode=-1;e.preventDefault();}
+  else if(k==='h')hullActive=!hullActive;
+  else if(k==='r'){initSheetPositions();clearTex(linkPP.fbs[0],SH_RES,SH_RES,1,1,0,0);clearTex(linkPP.fbs[1],SH_RES,SH_RES,1,1,0,0);clearTex(velPP.fbs[0],SH_RES,SH_RES,0,0,0,0);clearTex(velPP.fbs[1],SH_RES,SH_RES,0,0,0,0);}
+});
+
+function getCamPos(){
+  return [
+    camTarget[0]+camDist*Math.sin(camTheta)*Math.cos(camPhi),
+    camTarget[1]+camDist*Math.sin(camPhi),
+    camTarget[2]+camDist*Math.cos(camTheta)*Math.cos(camPhi)
+  ];
+}
+
+// ═══════════════════════════════════════════════════════════════
+// CFL SUB-STEPPING
+// ═══════════════════════════════════════════════════════════════
+function computeSubSteps(dt){
+  const dx=HF_WORLD/HF_RES,c=Math.sqrt(HF_G*HF_DEPTH);
+  const dtMax=dx/(2*c)*.9;
+  return Math.max(1,Math.ceil(dt/dtMax));
+}
+
+// ═══════════════════════════════════════════════════════════════
+// SIMULATION FRAME
+// ═══════════════════════════════════════════════════════════════
+function simulate(dt){
+  const safeDt=Math.min(dt,.033);
+  const shOrig=[-SH_WORLD/2,-SH_WORLD/2], shSize=[SH_WORLD,SH_WORLD];
+  const hfOrig=[-HF_WORLD/2,-HF_WORLD/2], hfSize=[HF_WORLD,HF_WORLD];
+
+  // ═══ PASS 1: Heightfield SWE ═══
+  const subSteps=computeSubSteps(safeDt);
+  const subDt=safeDt/subSteps;
+  const dampSub=Math.pow(HF_DAMP,subDt*60);
+  for(let i=0;i<subSteps;i++){
+    gl.bindFramebuffer(gl.FRAMEBUFFER,hfPP.writeFB);gl.viewport(0,0,HF_RES,HF_RES);
+    gl.useProgram(pSWE);
+    bindTex(0,hfPP.read);gl.uniform1i(U(pSWE,'u_hf'),0);
+    gl.uniform2f(U(pSWE,'u_res'),HF_RES,HF_RES);
+    gl.uniform1f(U(pSWE,'u_world'),HF_WORLD);gl.uniform1f(U(pSWE,'u_depth'),HF_DEPTH);
+    gl.uniform1f(U(pSWE,'u_grav'),HF_G);gl.uniform1f(U(pSWE,'u_dt'),subDt);
+    gl.uniform1f(U(pSWE,'u_damp'),dampSub);
+    if(i===0&&pendingImpulse){
+      gl.uniform2f(U(pSWE,'u_impulseC'),pendingImpulse.cx,pendingImpulse.cz);
+      gl.uniform1f(U(pSWE,'u_impulseR'),pendingImpulse.r);
+      gl.uniform1f(U(pSWE,'u_impulseS'),pendingImpulse.s);
+    }else{gl.uniform1f(U(pSWE,'u_impulseS'),0);}
+    drawQuad();hfPP.swap();
+    if(i===0)pendingImpulse=null;
+  }
+
+  // ═══ PASS 2: Diagnostics ═══
+  gl.bindFramebuffer(gl.FRAMEBUFFER,diagFB);gl.viewport(0,0,HF_RES,HF_RES);
+  gl.useProgram(pDiag);
+  bindTex(0,hfPP.read);gl.uniform1i(U(pDiag,'u_hf'),0);
+  gl.uniform2f(U(pDiag,'u_res'),HF_RES,HF_RES);
+  gl.uniform1f(U(pDiag,'u_world'),HF_WORLD);
+  gl.uniform1f(U(pDiag,'u_stride'),HF_RES>=1024?2:1);
+  drawQuad();
+
+  // ═══ PASS 3: Hull Contact ═══
+  gl.bindFramebuffer(gl.FRAMEBUFFER,hullFB);gl.viewport(0,0,SH_RES,SH_RES);
+  gl.useProgram(pHull);
+  gl.uniform2f(U(pHull,'u_shOrig'),shOrig[0],shOrig[1]);
+  gl.uniform2f(U(pHull,'u_shSize'),shSize[0],shSize[1]);
+  gl.uniform3f(U(pHull,'u_hullPos'),hullPos[0],hullPos[1],hullPos[2]);
+  gl.uniform3f(U(pHull,'u_hullVel'),hullVel[0],hullVel[1],hullVel[2]);
+  gl.uniform1f(U(pHull,'u_hullR'),HULL_R);
+  gl.uniform1f(U(pHull,'u_active'),hullActive?1:0);
+  drawQuad();
+
+  // ═══ PASS 4: Sheet Pressure ═══
+  gl.bindFramebuffer(gl.FRAMEBUFFER,pressFB);gl.viewport(0,0,SH_RES,SH_RES);
+  gl.useProgram(pPress);
+  bindTex(0,posPP.read);gl.uniform1i(U(pPress,'u_pos'),0);
+  bindTex(1,hfPP.read);gl.uniform1i(U(pPress,'u_hf'),1);
+  bindTex(2,diagTex);gl.uniform1i(U(pPress,'u_diag'),2);
+  gl.uniform2f(U(pPress,'u_shOrig'),shOrig[0],shOrig[1]);
+  gl.uniform2f(U(pPress,'u_shSize'),shSize[0],shSize[1]);
+  gl.uniform2f(U(pPress,'u_hfOrig'),hfOrig[0],hfOrig[1]);
+  gl.uniform2f(U(pPress,'u_hfSize'),hfSize[0],hfSize[1]);
+  gl.uniform1f(U(pPress,'u_pStiff'),100);
+  gl.uniform1f(U(pPress,'u_waveBoost'),.5);
+  drawQuad();
+
+  // ═══ PASS 5: Link Update — SEAM ENGINE ═══
+  const restEdge=SH_WORLD/SH_RES;
+  gl.bindFramebuffer(gl.FRAMEBUFFER,linkPP.writeFB);gl.viewport(0,0,SH_RES,SH_RES);
+  gl.useProgram(pLink);
+  bindTex(0,linkPP.read);gl.uniform1i(U(pLink,'u_link'),0);
+  bindTex(1,hullTex);gl.uniform1i(U(pLink,'u_hull'),1);
+  bindTex(2,posPP.read);gl.uniform1i(U(pLink,'u_pos'),2);
+  bindTex(3,velPP.read);gl.uniform1i(U(pLink,'u_vel'),3);
+  bindTex(4,hfPP.read);gl.uniform1i(U(pLink,'u_hf'),4);
+  bindTex(5,diagTex);gl.uniform1i(U(pLink,'u_diag'),5);
+  gl.uniform2f(U(pLink,'u_shRes'),SH_RES,SH_RES);
+  gl.uniform2f(U(pLink,'u_shOrig'),shOrig[0],shOrig[1]);
+  gl.uniform2f(U(pLink,'u_shSize'),shSize[0],shSize[1]);
+  gl.uniform2f(U(pLink,'u_hfOrig'),hfOrig[0],hfOrig[1]);
+  gl.uniform2f(U(pLink,'u_hfSize'),hfSize[0],hfSize[1]);
+  gl.uniform1f(U(pLink,'u_dt'),safeDt);
+  gl.uniform1f(U(pLink,'u_breakRate'),5);
+  gl.uniform1f(U(pLink,'u_healRate'),.5);
+  gl.uniform1f(U(pLink,'u_ascTh'),.3);
+  gl.uniform1f(U(pLink,'u_healProx'),.3);
+  gl.uniform1f(U(pLink,'u_strainTh'),3);
+  gl.uniform1f(U(pLink,'u_waveBreakR'),2);
+  gl.uniform1f(U(pLink,'u_restEdge'),restEdge);
+  drawQuad();
+  linkPP.swap();
+
+  // ═══ PASS 6: Viscosity ═══
+  gl.bindFramebuffer(gl.FRAMEBUFFER,velPP.writeFB);gl.viewport(0,0,SH_RES,SH_RES);
+  gl.useProgram(pVisc);
+  bindTex(0,velPP.read);gl.uniform1i(U(pVisc,'u_vel'),0);
+  bindTex(1,linkPP.read);gl.uniform1i(U(pVisc,'u_link'),1);
+  gl.uniform2f(U(pVisc,'u_shRes'),SH_RES,SH_RES);
+  gl.uniform1f(U(pVisc,'u_visc'),.05);
+  drawQuad();
+  velPP.swap();
+
+  // ═══ PASS 7: Force Integrate (MRT: pos+vel) ═══
+  gl.bindFramebuffer(gl.FRAMEBUFFER,mrtFB);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,posPP.write,0);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT1,gl.TEXTURE_2D,velPP.write,0);
+  gl.drawBuffers([gl.COLOR_ATTACHMENT0,gl.COLOR_ATTACHMENT1]);
+  gl.viewport(0,0,SH_RES,SH_RES);
+  gl.useProgram(pInteg);
+  bindTex(0,posPP.read);gl.uniform1i(U(pInteg,'u_pos'),0);
+  bindTex(1,velPP.read);gl.uniform1i(U(pInteg,'u_vel'),1);
+  bindTex(2,pressTex);gl.uniform1i(U(pInteg,'u_press'),2);
+  bindTex(3,normTex);gl.uniform1i(U(pInteg,'u_norm'),3);
+  bindTex(4,thickPP.read);gl.uniform1i(U(pInteg,'u_thick'),4);
+  bindTex(5,hullTex);gl.uniform1i(U(pInteg,'u_hull'),5);
+  bindTex(6,hfPP.read);gl.uniform1i(U(pInteg,'u_hf'),6);
+  gl.uniform2f(U(pInteg,'u_shRes'),SH_RES,SH_RES);
+  gl.uniform2f(U(pInteg,'u_shOrig'),shOrig[0],shOrig[1]);
+  gl.uniform2f(U(pInteg,'u_shSize'),shSize[0],shSize[1]);
+  gl.uniform2f(U(pInteg,'u_hfOrig'),hfOrig[0],hfOrig[1]);
+  gl.uniform2f(U(pInteg,'u_hfSize'),hfSize[0],hfSize[1]);
+  gl.uniform1f(U(pInteg,'u_dt'),safeDt);
+  gl.uniform1f(U(pInteg,'u_gravY'),-9.81);
+  gl.uniform1f(U(pInteg,'u_hullStiff'),2000);
+  gl.uniform1f(U(pInteg,'u_hfCoup'),.1);
+  gl.uniform1f(U(pInteg,'u_damp'),.5);
+  drawQuad();
+  // Reset drawBuffers
+  gl.drawBuffers([gl.COLOR_ATTACHMENT0]);
+  posPP.swap();velPP.swap();
+
+  // ═══ PASS 11: Normal Compute ═══
+  gl.bindFramebuffer(gl.FRAMEBUFFER,normFB);gl.viewport(0,0,SH_RES,SH_RES);
+  gl.useProgram(pNorm);
+  bindTex(0,posPP.read);gl.uniform1i(U(pNorm,'u_pos'),0);
+  bindTex(1,linkPP.read);gl.uniform1i(U(pNorm,'u_link'),1);
+  gl.uniform2f(U(pNorm,'u_shRes'),SH_RES,SH_RES);
+  drawQuad();
+}
+
+// ═══════════════════════════════════════════════════════════════
+// RENDERING
+// ═══════════════════════════════════════════════════════════════
+function render(){
+  const W=canvas.width,H=canvas.height;
+  gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+  gl.viewport(0,0,W,H);
+  gl.clearColor(.02,.05,.12,1);gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+  gl.enable(gl.DEPTH_TEST);gl.depthFunc(gl.LESS);
+
+  const eye=getCamPos();
+  const proj=mat4Perspective(Math.PI/3,W/H,.5,500);
+  const view=mat4LookAt(eye,camTarget,[0,1,0]);
+  const vp=mat4Mul(proj,view);
+
+  // ─── Ocean mesh ───
+  gl.useProgram(pOceanV);
+  bindTex(0,hfPP.read);gl.uniform1i(U(pOceanV,'u_hf'),0);
+  bindTex(1,diagTex);gl.uniform1i(U(pOceanV,'u_diag'),1);
+  gl.uniformMatrix4fv(U(pOceanV,'u_vp'),false,vp);
+  gl.uniform2f(U(pOceanV,'u_hfOrig'),-HF_WORLD/2,-HF_WORLD/2);
+  gl.
