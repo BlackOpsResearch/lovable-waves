@@ -33,6 +33,10 @@ interface OceanControlsProps {
   fps: number;
   debugMode: number;
   autoWaves: boolean;
+  sheetEnabled: boolean;
+  hullEnabled: boolean;
+  sprayEnabled: boolean;
+  gerstnerEnabled: boolean;
   onSettingsChange: (settings: Partial<OceanSettings>) => void;
   onCloudSettingsChange: (settings: Partial<CloudSettings>) => void;
   onPresetChange: (preset: string) => void;
@@ -41,6 +45,7 @@ interface OceanControlsProps {
   onToggleGravity: () => void;
   onDebugModeChange: (mode: number) => void;
   onToggleAutoWaves: () => void;
+  onToggleFeature: (feature: 'sheet' | 'hull' | 'spray' | 'gerstner') => void;
 }
 
 export function OceanControls({
@@ -52,6 +57,10 @@ export function OceanControls({
   fps,
   debugMode,
   autoWaves,
+  sheetEnabled,
+  hullEnabled,
+  sprayEnabled,
+  gerstnerEnabled,
   onSettingsChange,
   onCloudSettingsChange,
   onPresetChange,
@@ -60,6 +69,7 @@ export function OceanControls({
   onToggleGravity,
   onDebugModeChange,
   onToggleAutoWaves,
+  onToggleFeature,
 }: OceanControlsProps) {
   const [isExpanded, setIsExpanded] = useState(true);
   const [activeTab, setActiveTab] = useState('waves');
@@ -310,12 +320,21 @@ export function OceanControls({
 
             {/* Debug Tab */}
             <TabsContent value="debug" className="space-y-4 mt-4">
+              <label className="text-xs text-muted-foreground font-semibold block">Systems</label>
+              {[
+                { label: 'Gerstner Waves', key: 'gerstner' as const, enabled: gerstnerEnabled },
+                { label: 'Sheet Topology', key: 'sheet' as const, enabled: sheetEnabled },
+                { label: 'Hull Contact', key: 'hull' as const, enabled: hullEnabled },
+                { label: 'Spray Particles', key: 'spray' as const, enabled: sprayEnabled },
+              ].map(({ label, key, enabled }) => (
+                <div key={key} className="flex items-center justify-between">
+                  <label className="text-xs text-muted-foreground">{label}</label>
+                  <Switch checked={enabled} onCheckedChange={() => onToggleFeature(key)} />
+                </div>
+              ))}
               <div className="flex items-center justify-between">
                 <label className="text-xs text-muted-foreground">Auto Waves</label>
-                <Switch
-                  checked={autoWaves}
-                  onCheckedChange={onToggleAutoWaves}
-                />
+                <Switch checked={autoWaves} onCheckedChange={onToggleAutoWaves} />
               </div>
               <div>
                 <label className="text-xs text-muted-foreground mb-2 block">Debug Overlay</label>
@@ -326,7 +345,8 @@ export function OceanControls({
                     { label: 'Steep', mode: 1 },
                     { label: 'Jacob', mode: 2 },
                     { label: 'Foam', mode: 3 },
-                    { label: 'Raw', mode: 4 },
+                    { label: 'Sheet', mode: 4 },
+                    { label: 'Hull', mode: 5 },
                   ].map(({ label, mode }) => (
                     <Button
                       key={mode}
@@ -341,7 +361,7 @@ export function OceanControls({
                 </div>
               </div>
               <p className="text-[10px] text-muted-foreground">
-                Keys 0-4: toggle debug views | Space: pause
+                Keys 0-5: debug views | Space: pause | G: gravity
               </p>
             </TabsContent>
           </Tabs>

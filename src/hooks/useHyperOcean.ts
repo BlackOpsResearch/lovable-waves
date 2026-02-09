@@ -32,6 +32,10 @@ export interface OceanState {
   fps: number;
   debugMode: number;
   autoWaves: boolean;
+  sheetEnabled: boolean;
+  hullEnabled: boolean;
+  sprayEnabled: boolean;
+  gerstnerEnabled: boolean;
 }
 
 export function useHyperOcean(canvasRef: React.RefObject<HTMLCanvasElement | null>) {
@@ -50,6 +54,10 @@ export function useHyperOcean(canvasRef: React.RefObject<HTMLCanvasElement | nul
     fps: 0,
     debugMode: -1,
     autoWaves: true,
+    sheetEnabled: true,
+    hullEnabled: true,
+    sprayEnabled: true,
+    gerstnerEnabled: true,
   });
   
   // Camera
@@ -272,6 +280,29 @@ export function useHyperOcean(canvasRef: React.RefObject<HTMLCanvasElement | nul
     }
   }, []);
 
+  const toggleFeature = useCallback((feature: 'sheet' | 'hull' | 'spray' | 'gerstner') => {
+    const engine = engineRef.current;
+    if (!engine) return;
+    switch (feature) {
+      case 'sheet':
+        engine.sheetEnabled = !engine.sheetEnabled;
+        setState(prev => ({ ...prev, sheetEnabled: engine.sheetEnabled }));
+        break;
+      case 'hull':
+        engine.hullEnabled = !engine.hullEnabled;
+        setState(prev => ({ ...prev, hullEnabled: engine.hullEnabled }));
+        break;
+      case 'spray':
+        engine.sprayEnabled = !engine.sprayEnabled;
+        setState(prev => ({ ...prev, sprayEnabled: engine.sprayEnabled }));
+        break;
+      case 'gerstner':
+        engine.gerstnerEnabled = !engine.gerstnerEnabled;
+        setState(prev => ({ ...prev, gerstnerEnabled: engine.gerstnerEnabled }));
+        break;
+    }
+  }, []);
+
   // Initialize
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -327,7 +358,7 @@ export function useHyperOcean(canvasRef: React.RefObject<HTMLCanvasElement | nul
   return {
     state, handlePointerStart, handlePointerMove, handlePointerEnd, handleWheel,
     toggleGravity, togglePause, setPreset, updateSettings, updateCloudSettings, setSunPosition,
-    setDebugMode, toggleAutoWaves,
+    setDebugMode, toggleAutoWaves, toggleFeature,
   };
 }
 

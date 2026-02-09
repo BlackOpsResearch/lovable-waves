@@ -1,13 +1,9 @@
 /**
  * OPUS Water Engine — Core Engine
- * Implements the full SWE heightfield simulation with ping-pong textures,
- * diagnostics, foam, and PBR ocean rendering.
+ * Full SWE + Sheet + Hull + Spray + Gerstner pipeline
  * 
  * Reference: docs/OPUS_ORCHESTRATION.md
- * Based on the 17-pass pipeline architecture.
- * 
- * This engine works within our existing WebGL framework (GLContext, Shader, Texture, Mesh)
- * rather than three.js, maintaining compatibility with the current codebase.
+ * 17-pass GPU pipeline with CPU spray particles.
  */
 
 import { GLContextExtended } from '../webgl/GLContext';
@@ -17,11 +13,11 @@ import { Mesh } from '../webgl/Mesh';
 import { Vector } from '../webgl/Vector';
 import { Raytracer } from '../webgl/Raytracer';
 import { OpusConfig, DEFAULT_OPUS_CONFIG } from './OpusConfig';
+import { SpraySystem } from './SpraySystem';
 import {
   FULLSCREEN_VERT,
   SWE_UPDATE_FRAG,
   DIAGNOSTICS_FRAG,
-  FOAM_FRAG,
   OCEAN_SURFACE_VERT,
   OCEAN_SURFACE_FRAG,
   CLEAR_FRAG,
@@ -31,6 +27,14 @@ import {
   SPHERE_VERT,
   SPHERE_FRAG,
 } from './shaders/opusShaders';
+import {
+  SHEET_UPDATE_FRAG,
+  HULL_CONTACT_FRAG,
+  HULL_FEEDBACK_FRAG,
+  ENHANCED_FOAM_FRAG,
+  SPRAY_VERT,
+  SPRAY_FRAG,
+} from './shaders/sheetShaders';
 
 interface PingPong {
   a: Texture;
@@ -53,9 +57,11 @@ export class OpusEngine {
   config: OpusConfig;
   
   // Simulation textures
-  hfPP: PingPong;      // Heightfield ping-pong (RGBA: η, ∂η/∂t, u, v)
-  diagTex: Texture;     // Diagnostics (steepness, curvature, jacobian)
-  foamPP: PingPong;     // Foam density ping-pong
+  hfPP: PingPong;      // Heightfield (RGBA: η, ∂η/∂t, u, v)
+  diagTex: Texture;     // Diagnostics (steepness, curvature, jacobian, etaRate)
+  foamPP: PingPong;     // Foam density
+  sheetPP: PingPong;    // Sheet topology (seamState, thickness, viscosity, pressure)
+  hullTex: Texture;     // Hull displacement field (displacement, wake, bow, spray_src)
   
   // Shaders
   sweShader: Shader;
@@ -66,12 +72,23 @@ export class OpusEngine {
   debugShader: Shader;
   skyShader: Shader;
   sphereShader: Shader;
+  sheetShader: Shader;
+  hullShader: Shader;
+  hullFeedbackShader: Shader;
+  
+  // Spray system
+  spraySystem: SpraySystem;
+  sprayShader: Shader | null = null;
+  sprayPosBuf: WebGLBuffer | null = null;
+  sprayVelBuf: WebGLBuffer | null = null;
+  sprayLifeBuf: WebGLBuffer | null = null;
+  spraySizeBuf: WebGLBuffer | null = null;
   
   // Meshes
-  fsQuad: Mesh;         // Fullscreen quad for GPU passes
-  oceanMesh: Mesh;      // Displaced ocean surface mesh
-  skyMesh: Mesh;        // Sky dome
-  sphereMesh: Mesh;     // Interactive sphere
+  fsQuad: Mesh;
+  oceanMesh: Mesh;
+  skyMesh: Mesh;
+  sphereMesh: Mesh;
   
   // State
   time: number = 0;
@@ -79,29 +96,43 @@ export class OpusEngine {
   pendingImpulse: PendingImpulse | null = null;
   sunDir: Vector;
   cameraPos: Vector = new Vector(0, 5, 15);
-  debugMode: number = -1; // -1=off, 0=height, 1=steep, 2=jacobian, 3=foam
+  debugMode: number = -1;
   
   // Autonomous wave generation
   autoWavesEnabled: boolean = true;
   autoWaveTimer: number = 0;
   autoWaveInterval: number = 0.8;
   
+  // Feature toggles
+  sheetEnabled: boolean = true;
+  hullEnabled: boolean = true;
+  sprayEnabled: boolean = true;
+  gerstnerEnabled: boolean = true;
+  gerstnerAmplitude: number = 0.3;
+  gerstnerSteepness: number = 0.4;
+  windDirection: number = 45;
+  
   // Sphere
   sphereCenter: Vector = new Vector(0, 0.5, 0);
   sphereRadius: number = 1.5;
+  sphereVelocity: Vector = new Vector();
   
   constructor(gl: GLContextExtended, config: OpusConfig = DEFAULT_OPUS_CONFIG) {
     this.gl = gl;
     this.config = config;
     
-    // Normalize sun direction
     const sd = config.render.sunDir;
     this.sunDir = new Vector(sd[0], sd[1], sd[2]).unit();
     
+    const HR = config.hf.resolution;
+    const SR = config.sheet.resolution;
+    
     // Create simulation textures
-    this.hfPP = this.createPingPong(config.hf.resolution, config.hf.resolution);
-    this.diagTex = this.createSimTexture(config.hf.resolution, config.hf.resolution);
-    this.foamPP = this.createPingPong(config.hf.resolution, config.hf.resolution);
+    this.hfPP = this.createPingPong(HR, HR);
+    this.diagTex = this.createSimTexture(HR, HR);
+    this.foamPP = this.createPingPong(HR, HR);
+    this.sheetPP = this.createPingPong(SR, SR);
+    this.hullTex = this.createSimTexture(HR, HR);
     
     // Create meshes
     this.fsQuad = Mesh.plane(gl);
@@ -109,24 +140,56 @@ export class OpusEngine {
     this.skyMesh = Mesh.sphere(gl, { detail: 32 });
     this.sphereMesh = Mesh.sphere(gl, { detail: 12 });
     
-    // Compile shaders
+    // Compile core shaders
     this.sweShader = new Shader(gl, FULLSCREEN_VERT, SWE_UPDATE_FRAG);
     this.diagShader = new Shader(gl, FULLSCREEN_VERT, DIAGNOSTICS_FRAG);
-    this.foamShader = new Shader(gl, FULLSCREEN_VERT, FOAM_FRAG);
     this.clearShader = new Shader(gl, FULLSCREEN_VERT, CLEAR_FRAG);
     this.oceanShader = new Shader(gl, OCEAN_SURFACE_VERT, OCEAN_SURFACE_FRAG);
     this.debugShader = new Shader(gl, FULLSCREEN_VERT, DEBUG_VIS_FRAG);
     this.skyShader = new Shader(gl, SKY_VERT, SKY_FRAG);
     this.sphereShader = new Shader(gl, SPHERE_VERT, SPHERE_FRAG);
     
-    // Initialize textures to zero
-    this.clearTexture(this.hfPP.a, 0, 0, 0, 0);
-    this.clearTexture(this.hfPP.b, 0, 0, 0, 0);
-    this.clearTexture(this.diagTex, 0, 0, 0, 0);
-    this.clearTexture(this.foamPP.a, 0, 0, 0, 0);
-    this.clearTexture(this.foamPP.b, 0, 0, 0, 0);
+    // Compile new system shaders
+    this.sheetShader = new Shader(gl, FULLSCREEN_VERT, SHEET_UPDATE_FRAG);
+    this.hullShader = new Shader(gl, FULLSCREEN_VERT, HULL_CONTACT_FRAG);
+    this.hullFeedbackShader = new Shader(gl, FULLSCREEN_VERT, HULL_FEEDBACK_FRAG);
+    this.foamShader = new Shader(gl, FULLSCREEN_VERT, ENHANCED_FOAM_FRAG);
     
-    console.log(`OPUS Engine initialized: HF=${config.hf.resolution}², mesh=${config.render.meshSegments}seg`);
+    // Initialize spray system
+    this.spraySystem = new SpraySystem({
+      maxParticles: config.spray.max,
+      gravity: config.spray.gravity,
+      drag: config.spray.drag,
+      minVY: config.spray.minVY,
+      lifetime: config.spray.lifetime,
+    });
+    this.initSprayBuffers();
+    
+    // Initialize textures to zero
+    this.clearAllTextures();
+    
+    // Initialize sheet with thickness = 1
+    this.clearTexture(this.sheetPP.a, 0, 1, 0, 0);
+    this.clearTexture(this.sheetPP.b, 0, 1, 0, 0);
+    
+    console.log(`OPUS Engine initialized: HF=${HR}², Sheet=${SR}², Spray=${config.spray.max}, Gerstner=ON`);
+  }
+  
+  private initSprayBuffers() {
+    const gl = this.gl;
+    
+    try {
+      this.sprayShader = new Shader(gl, SPRAY_VERT, SPRAY_FRAG);
+    } catch (e) {
+      console.warn('Spray shader failed (point sprites may not be supported):', e);
+      this.sprayEnabled = false;
+      return;
+    }
+    
+    this.sprayPosBuf = gl.createBuffer();
+    this.sprayVelBuf = gl.createBuffer();
+    this.sprayLifeBuf = gl.createBuffer();
+    this.spraySizeBuf = gl.createBuffer();
   }
   
   private createSimTexture(w: number, h: number): Texture {
@@ -137,7 +200,6 @@ export class OpusEngine {
     
     const tex = new Texture(gl, w, h, { type, filter });
     if (!tex.canDrawTo()) {
-      // Fallback to half float
       const hfFilter = Texture.canUseHalfFloatingPointLinearFiltering(gl) ? gl.LINEAR : gl.NEAREST;
       return new Texture(gl, w, h, { type: gl.HALF_FLOAT_OES, filter: hfFilter });
     }
@@ -164,6 +226,15 @@ export class OpusEngine {
     });
   }
   
+  private clearAllTextures() {
+    this.clearTexture(this.hfPP.a, 0, 0, 0, 0);
+    this.clearTexture(this.hfPP.b, 0, 0, 0, 0);
+    this.clearTexture(this.diagTex, 0, 0, 0, 0);
+    this.clearTexture(this.foamPP.a, 0, 0, 0, 0);
+    this.clearTexture(this.foamPP.b, 0, 0, 0, 0);
+    this.clearTexture(this.hullTex, 0, 0, 0, 0);
+  }
+  
   private runPass(shader: Shader, target: Texture, uniforms: Record<string, unknown>) {
     const self = this;
     target.drawTo(() => {
@@ -171,44 +242,41 @@ export class OpusEngine {
     });
   }
   
-  /**
-   * Add a wave impulse at world position (x, z)
-   */
   addImpulse(x: number, z: number, radius: number = 5, strength: number = 50) {
     this.pendingImpulse = { cx: x, cz: z, radius, strength };
   }
   
-  /**
-   * Add a drop at normalized coordinates [-1, 1]
-   */
   addDrop(x: number, z: number, radius: number = 0.03, strength: number = 0.01) {
-    // Convert from [-1, 1] to world coords
     const worldX = x * this.config.hf.worldSize * 0.5;
     const worldZ = z * this.config.hf.worldSize * 0.5;
     const worldRadius = radius * this.config.hf.worldSize;
-    const worldStrength = strength * 500; // Scale up for SWE
+    const worldStrength = strength * 500;
     this.addImpulse(worldX, worldZ, worldRadius, worldStrength);
   }
   
-  /**
-   * Move the interactive sphere, creating water displacement
-   */
   moveSphere(oldCenter: Vector, newCenter: Vector, radius: number) {
+    this.sphereVelocity = newCenter.subtract(oldCenter);
     this.sphereCenter = newCenter;
     this.sphereRadius = radius;
     
-    // Create displacement impulse from sphere movement
-    const delta = newCenter.subtract(oldCenter);
-    const speed = delta.length();
+    const speed = this.sphereVelocity.length();
     if (speed > 0.001) {
-      const impStr = speed * 200 * radius;
-      this.addImpulse(newCenter.x, newCenter.z, radius * 3, impStr);
+      // Hull displacement creates wake, no more simple impulse
+      if (!this.hullEnabled) {
+        this.addImpulse(newCenter.x, newCenter.z, radius * 3, speed * 200 * radius);
+      }
+      
+      // Emit spray from hull contact
+      if (this.sprayEnabled && speed > 0.1) {
+        this.spraySystem.emitFromHull(
+          newCenter.x, newCenter.y, newCenter.z,
+          this.sphereVelocity.x, this.sphereVelocity.z,
+          radius, speed * 30
+        );
+      }
     }
   }
   
-  /**
-   * Compute CFL-safe sub-step count
-   */
   private computeSubSteps(dt: number): number {
     const dx = this.config.hf.worldSize / this.config.hf.resolution;
     const c = Math.sqrt(this.config.hf.gravity * this.config.hf.depth);
@@ -217,17 +285,18 @@ export class OpusEngine {
   }
   
   /**
-   * Step the simulation by dt seconds
+   * Step the full simulation pipeline
    */
   step(dt: number) {
-    if (dt > 0.033) dt = 0.033; // Cap at ~30 FPS min
+    if (dt > 0.033) dt = 0.033;
     if (dt < 0.001) dt = 0.001;
     
     const cfg = this.config;
     const HR = cfg.hf.resolution;
+    const SR = cfg.sheet.resolution;
     
     // ═══════════════════════════════════════════════
-    // PASS 1: SWE Heightfield Update (with sub-stepping)
+    // PASS 1: SWE Heightfield Update (sub-stepped)
     // ═══════════════════════════════════════════════
     const subSteps = this.computeSubSteps(dt);
     const subDt = dt / subSteps;
@@ -250,12 +319,11 @@ export class OpusEngine {
         u_impulseStrength: impulse ? impulse.strength : 0,
       });
       this.hfPP.swap();
-      
       if (i === 0) this.pendingImpulse = null;
     }
     
     // ═══════════════════════════════════════════════
-    // PASS 2: Heightfield Diagnostics
+    // PASS 2: Diagnostics
     // ═══════════════════════════════════════════════
     this.hfPP.read.bind(0);
     this.runPass(this.diagShader, this.diagTex, {
@@ -266,21 +334,105 @@ export class OpusEngine {
     });
     
     // ═══════════════════════════════════════════════
-    // PASS 15: Foam Advect + Generation
+    // PASS 3-4: Sheet Topology Update
+    // ═══════════════════════════════════════════════
+    if (this.sheetEnabled) {
+      this.sheetPP.read.bind(0);
+      this.hfPP.read.bind(1);
+      this.diagTex.bind(2);
+      this.runPass(this.sheetShader, this.sheetPP.write, {
+        u_sheet: 0,
+        u_hf: 1,
+        u_diag: 2,
+        u_res: [SR, SR],
+        u_worldSize: cfg.sheet.worldSize,
+        u_dt: dt,
+        u_breakRate: cfg.sheet.breakRate,
+        u_healRate: cfg.sheet.healRate,
+        u_waveStrainThresh: cfg.sheet.waveStrainThresh,
+        u_waveBreakRate: cfg.sheet.waveBreakRate,
+        u_viscosity: cfg.sheet.viscosity,
+        u_damping: cfg.sheet.damping,
+        u_hfCoupling: cfg.sheet.hfCoupling,
+        u_minThick: cfg.sheet.minThick,
+        u_maxThick: cfg.sheet.maxThick,
+        u_redistRate: cfg.sheet.redistRate,
+      });
+      this.sheetPP.swap();
+    }
+    
+    // ═══════════════════════════════════════════════
+    // PASS 5: Hull Contact
+    // ═══════════════════════════════════════════════
+    if (this.hullEnabled) {
+      this.hullTex.bind(0);
+      this.hfPP.read.bind(1);
+      
+      // Create a temp texture for hull output
+      const hullOut = this.createSimTexture(HR, HR);
+      this.runPass(this.hullShader, hullOut, {
+        u_hull: 0,
+        u_hf: 1,
+        u_res: [HR, HR],
+        u_worldSize: cfg.hf.worldSize,
+        u_dt: dt,
+        u_sphereCenter: this.sphereCenter,
+        u_sphereRadius: this.sphereRadius,
+        u_sphereVel: this.sphereVelocity,
+        u_hullStiffness: cfg.sheet.hullStiffness,
+        u_barrierStiffness: cfg.sheet.barrierStiffness,
+        u_slapDamping: cfg.sheet.slapDamping,
+      });
+      // Swap hull textures
+      this.hullTex.swapWith(hullOut);
+      
+      // PASS 6: Hull → HF Feedback
+      this.hfPP.read.bind(0);
+      this.hullTex.bind(1);
+      this.runPass(this.hullFeedbackShader, this.hfPP.write, {
+        u_hf: 0,
+        u_hull: 1,
+        u_res: [HR, HR],
+        u_dt: dt,
+        u_feedbackStrength: 0.5,
+      });
+      this.hfPP.swap();
+    }
+    
+    // ═══════════════════════════════════════════════
+    // PASS 15: Enhanced Foam (with sheet + hull sources)
     // ═══════════════════════════════════════════════
     this.foamPP.read.bind(0);
     this.hfPP.read.bind(1);
     this.diagTex.bind(2);
+    this.sheetPP.read.bind(3);
+    this.hullTex.bind(4);
     this.runPass(this.foamShader, this.foamPP.write, {
       u_foam: 0,
       u_hf: 1,
       u_diag: 2,
+      u_sheet: 3,
+      u_hull: 4,
       u_res: [HR, HR],
       u_worldSize: cfg.hf.worldSize,
       u_dt: dt,
       u_decay: cfg.foam.decay,
+      u_edgeGen: cfg.foam.edgeGen,
     });
     this.foamPP.swap();
+    
+    // ═══════════════════════════════════════════════
+    // CPU: Spray particle update
+    // ═══════════════════════════════════════════════
+    if (this.sprayEnabled) {
+      // Emit spray from autonomous wave breaking
+      if (this.autoWavesEnabled && Math.random() < 0.05) {
+        const x = (Math.random() - 0.5) * this.config.hf.worldSize * 0.6;
+        const z = (Math.random() - 0.5) * this.config.hf.worldSize * 0.6;
+        this.spraySystem.emitFromBreaking(x, z, 0.5 + Math.random() * 0.3);
+      }
+      this.spraySystem.update(dt);
+    }
     
     // Autonomous wave generation
     if (this.autoWavesEnabled) {
@@ -310,7 +462,7 @@ export class OpusEngine {
     gl.enable(gl.DEPTH_TEST);
     
     // ═══════════════════════════════════════════════
-    // Render sky dome
+    // Sky dome
     // ═══════════════════════════════════════════════
     gl.depthMask(false);
     this.skyShader.uniforms({
@@ -320,11 +472,12 @@ export class OpusEngine {
     gl.depthMask(true);
     
     // ═══════════════════════════════════════════════
-    // Render ocean surface
+    // Ocean surface (with Gerstner blend)
     // ═══════════════════════════════════════════════
     this.hfPP.read.bind(0);
     this.diagTex.bind(1);
     this.foamPP.read.bind(2);
+    this.hullTex.bind(3);
     
     gl.enable(gl.CULL_FACE);
     gl.cullFace(gl.BACK);
@@ -333,6 +486,7 @@ export class OpusEngine {
       u_hf: 0,
       u_diag: 1,
       u_foam: 2,
+      u_hull: 3,
       u_oceanScale: cfg.hf.worldSize,
       u_hfRes: [cfg.hf.resolution, cfg.hf.resolution],
       u_cameraPos: this.cameraPos,
@@ -345,12 +499,15 @@ export class OpusEngine {
       u_foamIntensity: cfg.render.foamIntensity,
       u_specPow: cfg.render.specularPower,
       u_envRefl: cfg.render.envReflection,
+      u_gerstnerAmp: this.gerstnerEnabled ? this.gerstnerAmplitude : 0,
+      u_gerstnerSteep: this.gerstnerSteepness,
+      u_windDir: this.windDirection,
     }).draw(this.oceanMesh);
     
     gl.disable(gl.CULL_FACE);
     
     // ═══════════════════════════════════════════════
-    // Render interactive sphere (with water line clipping)
+    // Interactive sphere
     // ═══════════════════════════════════════════════
     this.hfPP.read.bind(0);
     this.sphereShader.uniforms({
@@ -363,7 +520,14 @@ export class OpusEngine {
     }).draw(this.sphereMesh);
     
     // ═══════════════════════════════════════════════
-    // Debug overlay (if enabled)
+    // Spray particles
+    // ═══════════════════════════════════════════════
+    if (this.sprayEnabled && this.sprayShader && this.spraySystem.activeCount > 0) {
+      this.renderSpray();
+    }
+    
+    // ═══════════════════════════════════════════════
+    // Debug overlay
     // ═══════════════════════════════════════════════
     if (this.debugMode >= 0) {
       gl.enable(gl.BLEND);
@@ -371,11 +535,13 @@ export class OpusEngine {
       gl.depthMask(false);
       
       const debugTex = this.debugMode === 3 ? this.foamPP.read : 
-                        this.debugMode === 0 ? this.hfPP.read : this.diagTex;
+                        this.debugMode === 0 ? this.hfPP.read :
+                        this.debugMode === 4 ? this.sheetPP.read :
+                        this.debugMode === 5 ? this.hullTex : this.diagTex;
       debugTex.bind(0);
       this.debugShader.uniforms({
         u_tex: 0,
-        u_mode: this.debugMode,
+        u_mode: Math.min(this.debugMode, 4),
       }).draw(this.fsQuad);
       
       gl.depthMask(true);
@@ -385,71 +551,96 @@ export class OpusEngine {
     gl.disable(gl.DEPTH_TEST);
   }
   
-  /**
-   * Set debug visualization mode
-   * -1=off, 0=height, 1=steepness, 2=jacobian, 3=foam
-   */
-  setDebugMode(mode: number) {
-    this.debugMode = mode;
+  private renderSpray() {
+    const gl = this.gl;
+    const spray = this.spraySystem;
+    const shader = this.sprayShader!;
+    
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    gl.depthMask(false);
+    
+    gl.useProgram(shader.program);
+    
+    // Upload position buffer
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.sprayPosBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, spray.positionData.subarray(0, spray.activeCount * 3), gl.DYNAMIC_DRAW);
+    const posLoc = gl.getAttribLocation(shader.program, 'a_position');
+    if (posLoc >= 0) {
+      gl.enableVertexAttribArray(posLoc);
+      gl.vertexAttribPointer(posLoc, 3, gl.FLOAT, false, 0, 0);
+    }
+    
+    // Upload velocity buffer
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.sprayVelBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, spray.velocityData.subarray(0, spray.activeCount * 3), gl.DYNAMIC_DRAW);
+    const velLoc = gl.getAttribLocation(shader.program, 'a_velocity');
+    if (velLoc >= 0) {
+      gl.enableVertexAttribArray(velLoc);
+      gl.vertexAttribPointer(velLoc, 3, gl.FLOAT, false, 0, 0);
+    }
+    
+    // Upload life buffer
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.sprayLifeBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, spray.lifeData.subarray(0, spray.activeCount), gl.DYNAMIC_DRAW);
+    const lifeLoc = gl.getAttribLocation(shader.program, 'a_life');
+    if (lifeLoc >= 0) {
+      gl.enableVertexAttribArray(lifeLoc);
+      gl.vertexAttribPointer(lifeLoc, 1, gl.FLOAT, false, 0, 0);
+    }
+    
+    // Upload size buffer
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.spraySizeBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, spray.sizeData.subarray(0, spray.activeCount), gl.DYNAMIC_DRAW);
+    const sizeLoc = gl.getAttribLocation(shader.program, 'a_size');
+    if (sizeLoc >= 0) {
+      gl.enableVertexAttribArray(sizeLoc);
+      gl.vertexAttribPointer(sizeLoc, 1, gl.FLOAT, false, 0, 0);
+    }
+    
+    // Set uniforms using the shader wrapper's matrix system
+    shader.uniforms({
+      u_pointScale: 50.0,
+      u_cameraPos: this.cameraPos,
+      u_sunDir: this.sunDir,
+      u_sunColor: this.config.render.sunColor,
+    });
+    
+    // We need to set modelview/projection matrices
+    // The shader.uniforms call above handles matrix upload through the wrapper
+    gl.drawArrays(gl.POINTS, 0, spray.activeCount);
+    
+    // Cleanup
+    if (posLoc >= 0) gl.disableVertexAttribArray(posLoc);
+    if (velLoc >= 0) gl.disableVertexAttribArray(velLoc);
+    if (lifeLoc >= 0) gl.disableVertexAttribArray(lifeLoc);
+    if (sizeLoc >= 0) gl.disableVertexAttribArray(sizeLoc);
+    
+    gl.depthMask(true);
+    gl.disable(gl.BLEND);
   }
   
-  /**
-   * Get the heightfield texture for external use (e.g., caustics)
-   */
-  getHeightfieldTexture(): Texture {
-    return this.hfPP.read;
-  }
+  setDebugMode(mode: number) { this.debugMode = mode; }
+  getHeightfieldTexture(): Texture { return this.hfPP.read; }
+  getDiagnosticsTexture(): Texture { return this.diagTex; }
+  getFoamTexture(): Texture { return this.foamPP.read; }
+  getSheetTexture(): Texture { return this.sheetPP.read; }
+  getHullTexture(): Texture { return this.hullTex; }
   
-  /**
-   * Get diagnostics texture
-   */
-  getDiagnosticsTexture(): Texture {
-    return this.diagTex;
-  }
+  getApproxHeight(_worldX: number, _worldZ: number): number { return 0; }
   
-  /**
-   * Get foam texture
-   */
-  getFoamTexture(): Texture {
-    return this.foamPP.read;
-  }
+  setSunDirection(dir: Vector) { this.sunDir = dir.unit(); }
   
-  /**
-   * Sample height at a world position (approximate, CPU-side)
-   * Note: This is only for camera/sphere logic, NOT for GPU passes
-   */
-  getApproxHeight(_worldX: number, _worldZ: number): number {
-    // In a full implementation, we'd readback a small region
-    // For now, return 0 (sea level)
-    return 0;
-  }
-  
-  /**
-   * Set sun direction
-   */
-  setSunDirection(dir: Vector) {
-    this.sunDir = dir.unit();
-  }
-  
-  /**
-   * Reset simulation
-   */
   reset() {
-    this.clearTexture(this.hfPP.a, 0, 0, 0, 0);
-    this.clearTexture(this.hfPP.b, 0, 0, 0, 0);
-    this.clearTexture(this.diagTex, 0, 0, 0, 0);
-    this.clearTexture(this.foamPP.a, 0, 0, 0, 0);
-    this.clearTexture(this.foamPP.b, 0, 0, 0, 0);
+    this.clearAllTextures();
+    this.clearTexture(this.sheetPP.a, 0, 1, 0, 0);
+    this.clearTexture(this.sheetPP.b, 0, 1, 0, 0);
     this.pendingImpulse = null;
     this.time = 0;
     this.frameCount = 0;
   }
   
-  /**
-   * Dispose all GPU resources
-   */
   dispose() {
-    // Textures will be garbage collected with GL context
     console.log('OPUS Engine disposed');
   }
 }

@@ -169,16 +169,20 @@ export const FOAM_FRAG = `
 `;
 
 // ═══════════════════════════════════════════════════════════════
-// OCEAN SURFACE VERTEX SHADER (displaced mesh + normal from HF)
+// OCEAN SURFACE VERTEX SHADER (SWE + Gerstner blend + hull)
 // ═══════════════════════════════════════════════════════════════
 export const OCEAN_SURFACE_VERT = `
   uniform sampler2D u_hf;
   uniform sampler2D u_diag;
   uniform sampler2D u_foam;
+  uniform sampler2D u_hull;
   uniform float u_oceanScale;
   uniform vec2 u_hfRes;
   uniform vec3 u_cameraPos;
   uniform float u_time;
+  uniform float u_gerstnerAmp;
+  uniform float u_gerstnerSteep;
+  uniform float u_windDir;
   
   varying vec3 v_worldPos;
   varying vec3 v_normal;
@@ -188,32 +192,84 @@ export const OCEAN_SURFACE_VERT = `
   varying float v_distToCamera;
   varying vec2 v_uv;
   
+  // Inline Gerstner for vertex shader (3 primary waves for performance)
+  vec3 gerstner(vec2 pos, float t, vec2 dir, float wl, float amp, float steep) {
+    float k = 6.28318 / wl;
+    float c = sqrt(9.81 / k);
+    float f = k * (dot(dir, pos) - c * t);
+    float a = steep / k;
+    return vec3(dir.x * a * cos(f), amp * sin(f), dir.y * a * cos(f));
+  }
+  
   void main() {
     v_uv = gl_Vertex.xy * 0.5 + 0.5;
     
-    // Sample heightfield
+    // Sample SWE heightfield
     vec4 hfData = texture2D(u_hf, v_uv);
     float eta = hfData.r;
     
     // Compute world position
     vec2 worldXZ = (v_uv - 0.5) * u_oceanScale;
-    v_worldPos = vec3(worldXZ.x, eta, worldXZ.y);
-    v_eta = eta;
     
-    // Compute normal from heightfield gradients
+    // ── Gerstner Wave Blend ──
+    vec3 gerstnerOffset = vec3(0.0);
+    if (u_gerstnerAmp > 0.001) {
+      float windRad = u_windDir * 3.14159 / 180.0;
+      vec2 wd = vec2(cos(windRad), sin(windRad));
+      vec2 wd2 = normalize(wd + vec2(0.3, -0.2));
+      vec2 wd3 = normalize(vec2(-wd.y, wd.x) * 0.7 + wd * 0.3);
+      
+      gerstnerOffset += gerstner(worldXZ, u_time, wd, 60.0, u_gerstnerAmp * 1.2, u_gerstnerSteep * 0.8);
+      gerstnerOffset += gerstner(worldXZ, u_time * 1.1, wd2, 40.0, u_gerstnerAmp * 0.8, u_gerstnerSteep * 0.6);
+      gerstnerOffset += gerstner(worldXZ, u_time * 1.2, wd3, 25.0, u_gerstnerAmp * 0.5, u_gerstnerSteep * 0.5);
+      gerstnerOffset += gerstner(worldXZ, u_time * 1.3, normalize(wd + vec2(-0.1, 0.4)), 15.0, u_gerstnerAmp * 0.3, u_gerstnerSteep * 0.4);
+      gerstnerOffset += gerstner(worldXZ, u_time * 1.5, normalize(wd + vec2(0.5, 0.1)), 8.0, u_gerstnerAmp * 0.15, u_gerstnerSteep * 0.3);
+    }
+    
+    // Hull displacement
+    vec4 hullData = texture2D(u_hull, v_uv);
+    float hullDisp = hullData.r;
+    
+    // Delta layering: η_total = η_swe + δ_gerstner + δ_hull
+    float totalEta = eta + gerstnerOffset.y + hullDisp;
+    
+    v_worldPos = vec3(worldXZ.x + gerstnerOffset.x, totalEta, worldXZ.y + gerstnerOffset.z);
+    v_eta = totalEta;
+    
+    // Compute normal from combined heightfield
     float dx = u_oceanScale / u_hfRes.x;
     vec2 tx = 1.0 / u_hfRes;
     float hL = texture2D(u_hf, v_uv + vec2(-tx.x, 0.0)).r;
     float hR = texture2D(u_hf, v_uv + vec2( tx.x, 0.0)).r;
     float hD = texture2D(u_hf, v_uv + vec2(0.0, -tx.y)).r;
     float hU = texture2D(u_hf, v_uv + vec2(0.0,  tx.y)).r;
-    v_normal = normalize(vec3((hL - hR) / (2.0 * dx), 1.0, (hD - hU) / (2.0 * dx)));
     
-    // Sample diagnostics
+    // Add Gerstner normal contribution
+    float gNx = 0.0, gNz = 0.0;
+    if (u_gerstnerAmp > 0.001) {
+      float eps = dx;
+      float windRad = u_windDir * 3.14159 / 180.0;
+      vec2 wd = vec2(cos(windRad), sin(windRad));
+      float hGC = gerstner(worldXZ, u_time, wd, 60.0, u_gerstnerAmp * 1.2, u_gerstnerSteep * 0.8).y;
+      float hGL = gerstner(worldXZ + vec2(-eps, 0.0), u_time, wd, 60.0, u_gerstnerAmp * 1.2, u_gerstnerSteep * 0.8).y;
+      float hGR = gerstner(worldXZ + vec2(eps, 0.0), u_time, wd, 60.0, u_gerstnerAmp * 1.2, u_gerstnerSteep * 0.8).y;
+      float hGD = gerstner(worldXZ + vec2(0.0, -eps), u_time, wd, 60.0, u_gerstnerAmp * 1.2, u_gerstnerSteep * 0.8).y;
+      float hGU = gerstner(worldXZ + vec2(0.0, eps), u_time, wd, 60.0, u_gerstnerAmp * 1.2, u_gerstnerSteep * 0.8).y;
+      gNx = (hGL - hGR) / (2.0 * eps);
+      gNz = (hGD - hGU) / (2.0 * eps);
+    }
+    
+    v_normal = normalize(vec3(
+      (hL - hR) / (2.0 * dx) + gNx,
+      1.0,
+      (hD - hU) / (2.0 * dx) + gNz
+    ));
+    
+    // Diagnostics
     vec4 diagData = texture2D(u_diag, v_uv);
     v_steepness = diagData.r;
     
-    // Sample foam
+    // Foam
     v_foam = texture2D(u_foam, v_uv).r;
     
     // Distance for LOD/fog
