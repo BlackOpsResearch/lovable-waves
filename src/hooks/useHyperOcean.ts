@@ -30,6 +30,8 @@ export interface OceanState {
   settings: OceanSettings;
   cloudSettings: CloudSettings;
   fps: number;
+  debugMode: number;
+  autoWaves: boolean;
 }
 
 export function useHyperOcean(canvasRef: React.RefObject<HTMLCanvasElement | null>) {
@@ -46,6 +48,8 @@ export function useHyperOcean(canvasRef: React.RefObject<HTMLCanvasElement | nul
     settings: DEFAULT_OCEAN_SETTINGS,
     cloudSettings: DEFAULT_CLOUD_SETTINGS,
     fps: 0,
+    debugMode: -1,
+    autoWaves: true,
   });
   
   // Camera
@@ -254,6 +258,20 @@ export function useHyperOcean(canvasRef: React.RefObject<HTMLCanvasElement | nul
     }
   }, []);
 
+  const setDebugMode = useCallback((mode: number) => {
+    if (engineRef.current) {
+      engineRef.current.setDebugMode(mode);
+      setState(prev => ({ ...prev, debugMode: mode }));
+    }
+  }, []);
+
+  const toggleAutoWaves = useCallback(() => {
+    if (engineRef.current) {
+      engineRef.current.autoWavesEnabled = !engineRef.current.autoWavesEnabled;
+      setState(prev => ({ ...prev, autoWaves: engineRef.current?.autoWavesEnabled ?? true }));
+    }
+  }, []);
+
   // Initialize
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -309,6 +327,7 @@ export function useHyperOcean(canvasRef: React.RefObject<HTMLCanvasElement | nul
   return {
     state, handlePointerStart, handlePointerMove, handlePointerEnd, handleWheel,
     toggleGravity, togglePause, setPreset, updateSettings, updateCloudSettings, setSunPosition,
+    setDebugMode, toggleAutoWaves,
   };
 }
 

@@ -13,12 +13,13 @@ import {
   CloudSun, 
   Waves, 
   Palette, 
-  Settings2, 
   ChevronDown, 
   ChevronUp,
   Pause,
   Play,
-  Anchor
+  Anchor,
+  Bug,
+  Wind,
 } from 'lucide-react';
 import { OceanSettings, OCEAN_PRESETS } from '@/lib/ocean/OceanConfig';
 import { CloudSettings } from '@/lib/ocean/CloudRenderer';
@@ -30,12 +31,16 @@ interface OceanControlsProps {
   isPaused: boolean;
   gravityEnabled: boolean;
   fps: number;
+  debugMode: number;
+  autoWaves: boolean;
   onSettingsChange: (settings: Partial<OceanSettings>) => void;
   onCloudSettingsChange: (settings: Partial<CloudSettings>) => void;
   onPresetChange: (preset: string) => void;
   onSunPositionChange: (elevation: number, azimuth: number) => void;
   onTogglePause: () => void;
   onToggleGravity: () => void;
+  onDebugModeChange: (mode: number) => void;
+  onToggleAutoWaves: () => void;
 }
 
 export function OceanControls({
@@ -45,12 +50,16 @@ export function OceanControls({
   isPaused,
   gravityEnabled,
   fps,
+  debugMode,
+  autoWaves,
   onSettingsChange,
   onCloudSettingsChange,
   onPresetChange,
   onSunPositionChange,
   onTogglePause,
   onToggleGravity,
+  onDebugModeChange,
+  onToggleAutoWaves,
 }: OceanControlsProps) {
   const [isExpanded, setIsExpanded] = useState(true);
   const [activeTab, setActiveTab] = useState('waves');
@@ -124,7 +133,7 @@ export function OceanControls({
 
           {/* Tabbed Controls */}
           <Tabs value={activeTab} onValueChange={setActiveTab}>
-            <TabsList className="w-full grid grid-cols-4">
+            <TabsList className="w-full grid grid-cols-5">
               <TabsTrigger value="waves" className="text-xs">
                 <Waves className="w-3 h-3" />
               </TabsTrigger>
@@ -136,6 +145,9 @@ export function OceanControls({
               </TabsTrigger>
               <TabsTrigger value="water" className="text-xs">
                 <Palette className="w-3 h-3" />
+              </TabsTrigger>
+              <TabsTrigger value="debug" className="text-xs">
+                <Bug className="w-3 h-3" />
               </TabsTrigger>
             </TabsList>
 
@@ -294,6 +306,43 @@ export function OceanControls({
                 step={0.05}
                 onChange={(v) => onSettingsChange({ caustics: { ...settings.caustics, intensity: v } })}
               />
+            </TabsContent>
+
+            {/* Debug Tab */}
+            <TabsContent value="debug" className="space-y-4 mt-4">
+              <div className="flex items-center justify-between">
+                <label className="text-xs text-muted-foreground">Auto Waves</label>
+                <Switch
+                  checked={autoWaves}
+                  onCheckedChange={onToggleAutoWaves}
+                />
+              </div>
+              <div>
+                <label className="text-xs text-muted-foreground mb-2 block">Debug Overlay</label>
+                <div className="grid grid-cols-3 gap-1">
+                  {[
+                    { label: 'Off', mode: -1 },
+                    { label: 'Height', mode: 0 },
+                    { label: 'Steep', mode: 1 },
+                    { label: 'Jacob', mode: 2 },
+                    { label: 'Foam', mode: 3 },
+                    { label: 'Raw', mode: 4 },
+                  ].map(({ label, mode }) => (
+                    <Button
+                      key={mode}
+                      variant={debugMode === mode ? "default" : "outline"}
+                      size="sm"
+                      onClick={() => onDebugModeChange(mode)}
+                      className="text-xs"
+                    >
+                      {label}
+                    </Button>
+                  ))}
+                </div>
+              </div>
+              <p className="text-[10px] text-muted-foreground">
+                Keys 0-4: toggle debug views | Space: pause
+              </p>
             </TabsContent>
           </Tabs>
         </div>

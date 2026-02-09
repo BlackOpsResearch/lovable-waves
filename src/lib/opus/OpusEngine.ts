@@ -25,6 +25,7 @@ import {
   OCEAN_SURFACE_VERT,
   OCEAN_SURFACE_FRAG,
   CLEAR_FRAG,
+  DEBUG_VIS_FRAG,
   SKY_VERT,
   SKY_FRAG,
   SPHERE_VERT,
@@ -62,6 +63,7 @@ export class OpusEngine {
   foamShader: Shader;
   clearShader: Shader;
   oceanShader: Shader;
+  debugShader: Shader;
   skyShader: Shader;
   sphereShader: Shader;
   
@@ -77,6 +79,12 @@ export class OpusEngine {
   pendingImpulse: PendingImpulse | null = null;
   sunDir: Vector;
   cameraPos: Vector = new Vector(0, 5, 15);
+  debugMode: number = -1; // -1=off, 0=height, 1=steep, 2=jacobian, 3=foam
+  
+  // Autonomous wave generation
+  autoWavesEnabled: boolean = true;
+  autoWaveTimer: number = 0;
+  autoWaveInterval: number = 0.8;
   
   // Sphere
   sphereCenter: Vector = new Vector(0, 0.5, 0);
@@ -107,6 +115,7 @@ export class OpusEngine {
     this.foamShader = new Shader(gl, FULLSCREEN_VERT, FOAM_FRAG);
     this.clearShader = new Shader(gl, FULLSCREEN_VERT, CLEAR_FRAG);
     this.oceanShader = new Shader(gl, OCEAN_SURFACE_VERT, OCEAN_SURFACE_FRAG);
+    this.debugShader = new Shader(gl, FULLSCREEN_VERT, DEBUG_VIS_FRAG);
     this.skyShader = new Shader(gl, SKY_VERT, SKY_FRAG);
     this.sphereShader = new Shader(gl, SPHERE_VERT, SPHERE_FRAG);
     
@@ -273,6 +282,20 @@ export class OpusEngine {
     });
     this.foamPP.swap();
     
+    // Autonomous wave generation
+    if (this.autoWavesEnabled) {
+      this.autoWaveTimer += dt;
+      if (this.autoWaveTimer >= this.autoWaveInterval) {
+        this.autoWaveTimer -= this.autoWaveInterval;
+        const angle = Math.random() * Math.PI * 2;
+        const dist = 0.3 + Math.random() * 0.5;
+        const x = Math.cos(angle) * dist;
+        const z = Math.sin(angle) * dist;
+        const sign = Math.random() > 0.5 ? 1 : -1;
+        this.addDrop(x, z, 0.015 + Math.random() * 0.025, sign * (0.005 + Math.random() * 0.01));
+      }
+    }
+    
     this.time += dt;
     this.frameCount++;
   }
@@ -327,7 +350,7 @@ export class OpusEngine {
     gl.disable(gl.CULL_FACE);
     
     // ═══════════════════════════════════════════════
-    // Render interactive sphere
+    // Render interactive sphere (with water line clipping)
     // ═══════════════════════════════════════════════
     this.hfPP.read.bind(0);
     this.sphereShader.uniforms({
@@ -339,7 +362,35 @@ export class OpusEngine {
       u_oceanScale: cfg.hf.worldSize,
     }).draw(this.sphereMesh);
     
+    // ═══════════════════════════════════════════════
+    // Debug overlay (if enabled)
+    // ═══════════════════════════════════════════════
+    if (this.debugMode >= 0) {
+      gl.enable(gl.BLEND);
+      gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+      gl.depthMask(false);
+      
+      const debugTex = this.debugMode === 3 ? this.foamPP.read : 
+                        this.debugMode === 0 ? this.hfPP.read : this.diagTex;
+      debugTex.bind(0);
+      this.debugShader.uniforms({
+        u_tex: 0,
+        u_mode: this.debugMode,
+      }).draw(this.fsQuad);
+      
+      gl.depthMask(true);
+      gl.disable(gl.BLEND);
+    }
+    
     gl.disable(gl.DEPTH_TEST);
+  }
+  
+  /**
+   * Set debug visualization mode
+   * -1=off, 0=height, 1=steepness, 2=jacobian, 3=foam
+   */
+  setDebugMode(mode: number) {
+    this.debugMode = mode;
   }
   
   /**
