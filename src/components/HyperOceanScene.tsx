@@ -22,6 +22,8 @@ export function HyperOceanScene() {
     updateSettings,
     updateCloudSettings,
     setSunPosition,
+    setDebugMode,
+    toggleAutoWaves,
   } = useHyperOcean(canvasRef);
 
   // Mouse handlers
@@ -68,22 +70,30 @@ export function HyperOceanScene() {
         togglePause();
       } else if (e.key === 'g' || e.key === 'G') {
         toggleGravity();
+      } else if (e.key === '0') {
+        setDebugMode(state.debugMode === 0 ? -1 : 0);
       } else if (e.key === '1') {
-        setPreset('calm');
+        setDebugMode(state.debugMode === 1 ? -1 : 1);
       } else if (e.key === '2') {
-        setPreset('moderate');
+        setDebugMode(state.debugMode === 2 ? -1 : 2);
       } else if (e.key === '3') {
-        setPreset('stormy');
+        setDebugMode(state.debugMode === 3 ? -1 : 3);
       } else if (e.key === '4') {
+        setDebugMode(state.debugMode === 4 ? -1 : 4);
+      } else if (e.key === '6') {
+        setPreset('calm');
+      } else if (e.key === '7') {
+        setPreset('moderate');
+      } else if (e.key === '8') {
+        setPreset('stormy');
+      } else if (e.key === '9') {
         setPreset('sunset');
-      } else if (e.key === '5') {
-        setPreset('tropical');
       }
     };
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [togglePause, toggleGravity, setPreset]);
+  }, [togglePause, toggleGravity, setPreset, setDebugMode, state.debugMode]);
 
   if (state.error) {
     return (
@@ -136,12 +146,16 @@ export function HyperOceanScene() {
           isPaused={state.isPaused}
           gravityEnabled={state.gravityEnabled}
           fps={state.fps}
+          debugMode={state.debugMode}
+          autoWaves={state.autoWaves}
           onSettingsChange={updateSettings}
           onCloudSettingsChange={updateCloudSettings}
           onPresetChange={setPreset}
           onSunPositionChange={setSunPosition}
           onTogglePause={togglePause}
           onToggleGravity={toggleGravity}
+          onDebugModeChange={setDebugMode}
+          onToggleAutoWaves={toggleAutoWaves}
         />
       )}
 
@@ -151,9 +165,8 @@ export function HyperOceanScene() {
           <p>Drag water: Create ripples</p>
           <p>Drag sphere: Move it</p>
           <p>Drag elsewhere: Orbit camera</p>
-          <p>Scroll: Zoom in/out</p>
-          <p>Space: Pause | G: Gravity</p>
-          <p>1-5: Presets</p>
+          <p>Scroll: Zoom | Space: Pause | G: Gravity</p>
+          <p>0-4: Debug overlays | 6-9: Presets</p>
         </div>
       )}
 
