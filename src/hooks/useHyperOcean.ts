@@ -106,21 +106,54 @@ export function useHyperOcean(canvasRef: React.RefObject<HTMLCanvasElement | nul
     if (!engine) return;
     if (seconds > 1) return;
     
-    // Sphere physics
+    // Sphere physics with GPU-readback buoyancy
     if (modeRef.current === MODE_MOVE_SPHERE) {
       velocityRef.current = new Vector();
     } else if (useSpherePhysicsRef.current) {
-      const percentUnderWater = Math.max(0, Math.min(1, (radiusRef.current - centerRef.current.y) / (2 * radiusRef.current)));
+      const center = centerRef.current;
+      const radius = radiusRef.current;
+      
+      // Read actual water height at sphere position from heightfield
+      const waterHeight = engine.getHeightAt(center.x, center.z);
+      
+      // Calculate submersion based on actual wave surface
+      const sphereBottom = center.y - radius;
+      const submersionDepth = Math.max(0, waterHeight - sphereBottom);
+      const percentUnderWater = Math.max(0, Math.min(1, submersionDepth / (2 * radius)));
+      
+      // Gravity
       velocityRef.current = velocityRef.current.add(
-        gravityRef.current.multiply(seconds - 1.1 * seconds * percentUnderWater)
+        gravityRef.current.multiply(seconds)
       );
-      velocityRef.current = velocityRef.current.subtract(
-        velocityRef.current.unit().multiply(percentUnderWater * seconds * velocityRef.current.dot(velocityRef.current))
-      );
-      centerRef.current = centerRef.current.add(velocityRef.current.multiply(seconds));
-      if (centerRef.current.y < radiusRef.current - 1) {
-        centerRef.current.y = radiusRef.current - 1;
-        velocityRef.current.y = Math.abs(velocityRef.current.y) * 0.7;
+      
+      // Buoyancy force proportional to displaced volume (Archimedes)
+      const buoyancyForce = percentUnderWater * 1.8 * 9.81; // ~1.8x water density compensation
+      velocityRef.current.y += buoyancyForce * seconds;
+      
+      // Water drag (stronger when submerged)
+      const dragCoeff = 0.5 + percentUnderWater * 3.0;
+      const speed = velocityRef.current.length();
+      if (speed > 0.001) {
+        const dragForce = dragCoeff * speed * seconds;
+        velocityRef.current = velocityRef.current.subtract(
+          velocityRef.current.unit().multiply(Math.min(dragForce, speed * 0.9))
+        );
+      }
+      
+      // Apply velocity
+      centerRef.current = center.add(velocityRef.current.multiply(seconds));
+      
+      // Wave-following: gently push sphere to match wave surface when floating
+      if (percentUnderWater > 0.1 && percentUnderWater < 0.9) {
+        const targetY = waterHeight + radius * 0.3; // float ~30% above surface
+        const followStrength = 2.0 * seconds;
+        centerRef.current.y += (targetY - centerRef.current.y) * followStrength;
+      }
+      
+      // Hard floor
+      if (centerRef.current.y < radius - 3) {
+        centerRef.current.y = radius - 3;
+        velocityRef.current.y = Math.abs(velocityRef.current.y) * 0.5;
       }
     }
     

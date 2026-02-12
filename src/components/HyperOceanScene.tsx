@@ -81,6 +81,8 @@ export function HyperOceanScene() {
         setDebugMode(state.debugMode === 3 ? -1 : 3);
       } else if (e.key === '4') {
         setDebugMode(state.debugMode === 4 ? -1 : 4);
+      } else if (e.key === '5') {
+        setDebugMode(state.debugMode === 5 ? -1 : 5);
       } else if (e.key === '6') {
         setPreset('calm');
       } else if (e.key === '7') {
