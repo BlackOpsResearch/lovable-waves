@@ -169,7 +169,7 @@ export const FOAM_FRAG = `
 `;
 
 // ═══════════════════════════════════════════════════════════════
-// OCEAN SURFACE VERTEX SHADER (SWE + Gerstner blend + hull)
+// OCEAN SURFACE VERTEX SHADER (SWE + JONSWAP Gerstner + hull)
 // ═══════════════════════════════════════════════════════════════
 export const OCEAN_SURFACE_VERT = `
   uniform sampler2D u_hf;
@@ -183,6 +183,8 @@ export const OCEAN_SURFACE_VERT = `
   uniform float u_gerstnerAmp;
   uniform float u_gerstnerSteep;
   uniform float u_windDir;
+  uniform float u_windSpeed;
+  uniform float u_fetch;
   
   varying vec3 v_worldPos;
   varying vec3 v_normal;
@@ -192,13 +194,22 @@ export const OCEAN_SURFACE_VERT = `
   varying float v_distToCamera;
   varying vec2 v_uv;
   
-  // Inline Gerstner for vertex shader (3 primary waves for performance)
-  vec3 gerstner(vec2 pos, float t, vec2 dir, float wl, float amp, float steep) {
-    float k = 6.28318 / wl;
-    float c = sqrt(9.81 / k);
-    float f = k * (dot(dir, pos) - c * t);
-    float a = steep / k;
-    return vec3(dir.x * a * cos(f), amp * sin(f), dir.y * a * cos(f));
+  // ── JONSWAP Spectrum Gerstner ──
+  const float PI_W = 3.14159265359;
+  const float GRAV = 9.81;
+  
+  float jonswapS(float omega, float omegaP, float alpha) {
+    float sigma = omega <= omegaP ? 0.07 : 0.09;
+    float r = exp(-pow(omega - omegaP, 2.0) / (2.0 * sigma * sigma * omegaP * omegaP));
+    float pm = (alpha * GRAV * GRAV / pow(omega, 5.0)) * exp(-1.25 * pow(omegaP / omega, 4.0));
+    return pm * pow(3.3, r);
+  }
+  
+  vec3 gerstnerJ(vec2 pos, float t, vec2 dir, float omega, float amp, float steep) {
+    float k = omega * omega / GRAV;
+    float phase = k * dot(dir, pos) - omega * t;
+    float Q = steep / max(k, 0.001);
+    return vec3(dir.x * Q * cos(phase), amp * sin(phase), dir.y * Q * cos(phase));
   }
   
   void main() {
@@ -211,19 +222,47 @@ export const OCEAN_SURFACE_VERT = `
     // Compute world position
     vec2 worldXZ = (v_uv - 0.5) * u_oceanScale;
     
-    // ── Gerstner Wave Blend ──
+    // ── JONSWAP-driven Gerstner Wave Blend ──
     vec3 gerstnerOffset = vec3(0.0);
     if (u_gerstnerAmp > 0.001) {
-      float windRad = u_windDir * 3.14159 / 180.0;
+      float windRad = u_windDir * PI_W / 180.0;
       vec2 wd = vec2(cos(windRad), sin(windRad));
-      vec2 wd2 = normalize(wd + vec2(0.3, -0.2));
-      vec2 wd3 = normalize(vec2(-wd.y, wd.x) * 0.7 + wd * 0.3);
       
-      gerstnerOffset += gerstner(worldXZ, u_time, wd, 60.0, u_gerstnerAmp * 1.2, u_gerstnerSteep * 0.8);
-      gerstnerOffset += gerstner(worldXZ, u_time * 1.1, wd2, 40.0, u_gerstnerAmp * 0.8, u_gerstnerSteep * 0.6);
-      gerstnerOffset += gerstner(worldXZ, u_time * 1.2, wd3, 25.0, u_gerstnerAmp * 0.5, u_gerstnerSteep * 0.5);
-      gerstnerOffset += gerstner(worldXZ, u_time * 1.3, normalize(wd + vec2(-0.1, 0.4)), 15.0, u_gerstnerAmp * 0.3, u_gerstnerSteep * 0.4);
-      gerstnerOffset += gerstner(worldXZ, u_time * 1.5, normalize(wd + vec2(0.5, 0.1)), 8.0, u_gerstnerAmp * 0.15, u_gerstnerSteep * 0.3);
+      // Compute JONSWAP parameters from wind/fetch
+      float ws = max(u_windSpeed, 0.5);
+      float omegaP = 22.0 * pow((GRAV * GRAV) / (ws * u_fetch), 0.333);
+      float alpha = 0.076 * pow(GRAV * u_fetch / (ws * ws), -0.22);
+      
+      // Generate wave components from spectrum (8 waves for vertex shader)
+      float omegaMin = omegaP * 0.5;
+      float omegaMax = omegaP * 4.0;
+      float logMin = log(omegaMin);
+      float logMax = log(omegaMax);
+      
+      // Direction offsets for spread
+      float angles[8];
+      angles[0] = 0.0; angles[1] = 0.15; angles[2] = -0.25; angles[3] = 0.4;
+      angles[4] = -0.1; angles[5] = 0.55; angles[6] = -0.45; angles[7] = 0.7;
+      
+      float speeds[8];
+      speeds[0] = 1.0; speeds[1] = 1.05; speeds[2] = 1.1; speeds[3] = 0.95;
+      speeds[4] = 1.15; speeds[5] = 0.9; speeds[6] = 1.2; speeds[7] = 0.85;
+      
+      // LOD: fewer waves at distance
+      float dist = length(u_cameraPos.xz - worldXZ);
+      int numWaves = int(mix(3.0, 8.0, 1.0 - smoothstep(0.0, 500.0, dist)));
+      
+      for (int i = 0; i < 8; i++) {
+        if (i >= numWaves) break;
+        float t = float(i) / 7.0;
+        float omega = exp(mix(logMin, logMax, t));
+        float S = jonswapS(omega, omegaP, alpha);
+        float dOmega = (logMax - logMin) / 8.0 * omega;
+        float amp = sqrt(2.0 * S * dOmega) * u_gerstnerAmp;
+        vec2 dir = vec2(cos(windRad + angles[i]), sin(windRad + angles[i]));
+        float steep = u_gerstnerSteep * min(1.0, 0.4 + 0.6 * omega / omegaP);
+        gerstnerOffset += gerstnerJ(worldXZ, u_time * speeds[i], dir, omega, amp, steep);
+      }
     }
     
     // Hull displacement
@@ -244,17 +283,23 @@ export const OCEAN_SURFACE_VERT = `
     float hD = texture2D(u_hf, v_uv + vec2(0.0, -tx.y)).r;
     float hU = texture2D(u_hf, v_uv + vec2(0.0,  tx.y)).r;
     
-    // Add Gerstner normal contribution
+    // Add Gerstner normal contribution (finite difference on dominant wave)
     float gNx = 0.0, gNz = 0.0;
     if (u_gerstnerAmp > 0.001) {
       float eps = dx;
-      float windRad = u_windDir * 3.14159 / 180.0;
+      float windRad = u_windDir * PI_W / 180.0;
       vec2 wd = vec2(cos(windRad), sin(windRad));
-      float hGC = gerstner(worldXZ, u_time, wd, 60.0, u_gerstnerAmp * 1.2, u_gerstnerSteep * 0.8).y;
-      float hGL = gerstner(worldXZ + vec2(-eps, 0.0), u_time, wd, 60.0, u_gerstnerAmp * 1.2, u_gerstnerSteep * 0.8).y;
-      float hGR = gerstner(worldXZ + vec2(eps, 0.0), u_time, wd, 60.0, u_gerstnerAmp * 1.2, u_gerstnerSteep * 0.8).y;
-      float hGD = gerstner(worldXZ + vec2(0.0, -eps), u_time, wd, 60.0, u_gerstnerAmp * 1.2, u_gerstnerSteep * 0.8).y;
-      float hGU = gerstner(worldXZ + vec2(0.0, eps), u_time, wd, 60.0, u_gerstnerAmp * 1.2, u_gerstnerSteep * 0.8).y;
+      float ws = max(u_windSpeed, 0.5);
+      float omegaP = 22.0 * pow((GRAV * GRAV) / (ws * u_fetch), 0.333);
+      float alpha = 0.076 * pow(GRAV * u_fetch / (ws * ws), -0.22);
+      float S = jonswapS(omegaP, omegaP, alpha);
+      float amp = sqrt(2.0 * S * omegaP * 0.3) * u_gerstnerAmp;
+      
+      float hGC = gerstnerJ(worldXZ, u_time, wd, omegaP, amp, u_gerstnerSteep * 0.5).y;
+      float hGL = gerstnerJ(worldXZ + vec2(-eps, 0.0), u_time, wd, omegaP, amp, u_gerstnerSteep * 0.5).y;
+      float hGR = gerstnerJ(worldXZ + vec2(eps, 0.0), u_time, wd, omegaP, amp, u_gerstnerSteep * 0.5).y;
+      float hGD = gerstnerJ(worldXZ + vec2(0.0, -eps), u_time, wd, omegaP, amp, u_gerstnerSteep * 0.5).y;
+      float hGU = gerstnerJ(worldXZ + vec2(0.0, eps), u_time, wd, omegaP, amp, u_gerstnerSteep * 0.5).y;
       gNx = (hGL - hGR) / (2.0 * eps);
       gNz = (hGD - hGU) / (2.0 * eps);
     }
@@ -293,6 +338,9 @@ export const OCEAN_SURFACE_FRAG = `
   uniform float u_specPow;
   uniform float u_envRefl;
   uniform float u_time;
+  uniform float u_turbidity;
+  uniform float u_rayleighScale;
+  uniform float u_sunIntensity;
   uniform sampler2D u_hf;
   uniform sampler2D u_foam;
   
@@ -310,23 +358,35 @@ export const OCEAN_SURFACE_FRAG = `
     return F0 + (1.0 - F0) * pow(1.0 - cosTheta, 5.0);
   }
   
-  // Simple sky color for reflections
+  // Physically-based sky color for reflections (Rayleigh+Mie approximation)
   vec3 getSkyColor(vec3 dir) {
-    float sunFade = clamp(1.0 - exp(-u_sunDir.y * 10.0), 0.0, 1.0);
+    vec3 sunDir = normalize(u_sunDir);
+    float cosTheta = dot(dir, sunDir);
+    float sunFade = clamp(1.0 - exp(-sunDir.y * 10.0), 0.0, 1.0);
     float skyFade = max(dir.y, 0.0);
     
-    vec3 skyBlue = vec3(0.3, 0.55, 0.8) * sunFade;
-    vec3 horizon = vec3(0.6, 0.7, 0.8) * sunFade;
-    vec3 sunGlow = vec3(1.0, 0.7, 0.4) * sunFade;
+    // Rayleigh-dominated blue sky
+    vec3 rayleighColor = vec3(0.15, 0.35, 0.65) * u_rayleighScale * sunFade;
     
-    vec3 sky = mix(horizon, skyBlue, skyFade);
+    // Horizon warm band (Mie forward-scatter)
+    float horizonGlow = exp(-skyFade * 3.0) * sunFade;
+    vec3 horizonColor = mix(vec3(0.5, 0.4, 0.3), vec3(0.7, 0.5, 0.3), u_turbidity * 0.1) * horizonGlow;
     
-    // Sun glow near horizon
-    float sunAngle = max(dot(dir, u_sunDir), 0.0);
-    sky += sunGlow * pow(sunAngle, 8.0) * 0.5;
+    vec3 sky = mix(horizonColor, rayleighColor, pow(skyFade, 0.5 + u_turbidity * 0.02));
+    
+    // Mie glow around sun
+    float mieGlow = pow(max(cosTheta, 0.0), 8.0);
+    sky += vec3(1.0, 0.7, 0.3) * mieGlow * u_turbidity * 0.05 * sunFade;
     
     // Sun disc
-    sky += u_sunColor * pow(sunAngle, 2048.0) * 10.0;
+    sky += u_sunColor * pow(max(cosTheta, 0.0), 4096.0) * u_sunIntensity * 10.0;
+    
+    // Sunset coloring
+    if (sunDir.y < 0.2 && sunDir.y > -0.1) {
+      float sunsetFactor = 1.0 - smoothstep(-0.1, 0.2, sunDir.y);
+      float angularDist = 1.0 - max(cosTheta, 0.0);
+      sky += vec3(1.0, 0.4, 0.1) * sunsetFactor * exp(-angularDist * 2.0) * 0.5;
+    }
     
     return sky;
   }
@@ -346,11 +406,11 @@ export const OCEAN_SURFACE_FRAG = `
     
     // Wrapped diffuse lighting
     float wrap = max((dot(N, L) + 0.3) / 1.3, 0.0);
-    vec3 diffuse = baseColor * wrap * u_sunColor;
+    vec3 diffuse = baseColor * wrap * u_sunColor * u_sunIntensity;
     
     // Specular (Blinn-Phong)
     float NdotH = max(dot(N, H), 0.0);
-    vec3 specular = u_sunColor * pow(NdotH, u_specPow) * F;
+    vec3 specular = u_sunColor * pow(NdotH, u_specPow) * F * u_sunIntensity;
     
     // Environment reflection
     vec3 reflDir = reflect(-V, N);
@@ -359,9 +419,9 @@ export const OCEAN_SURFACE_FRAG = `
     
     // Subsurface scattering
     float sss = pow(max(0.0, dot(-V, L)), 4.0);
-    vec3 sssColor = vec3(0.1, 0.4, 0.3) * sss * 0.3;
+    vec3 sssColor = vec3(0.1, 0.4, 0.3) * sss * 0.3 * u_sunIntensity;
     
-    // Foam from steepness + foam texture
+    // Foam
     float foamFromSteep = smoothstep(u_foamThresh, u_foamThresh + 0.15, v_steepness);
     float totalFoam = max(foamFromSteep, v_foam) * u_foamIntensity;
     totalFoam = clamp(totalFoam, 0.0, 1.0);
@@ -371,59 +431,66 @@ export const OCEAN_SURFACE_FRAG = `
     vec3 waterSurface = diffuse + specular + envColor + sssColor;
     
     // ── Shore/Beach System ──
-    // Shore detection: edges of the simulation domain act as shoreline
     vec2 shoreUV = v_uv;
     float shoreDist = min(min(shoreUV.x, 1.0 - shoreUV.x), min(shoreUV.y, 1.0 - shoreUV.y));
     float shoreZone = smoothstep(0.12, 0.02, shoreDist);
     
-    // Shallow water depth for shore
-    float shoreDepth = shoreDist * 20.0; // depth decreases near shore
-    
-    // Shore foam accumulation (waves pile up at shore)
     float shoreFoam = shoreZone * (0.3 + 0.5 * abs(sin(v_worldPos.x * 0.5 + u_time * 1.5)))
                     * (0.5 + v_steepness * 2.0);
     totalFoam = max(totalFoam, shoreFoam);
     
-    // Sand color blending near shore
     vec3 sandColor = vec3(0.76, 0.70, 0.50);
     vec3 wetSandColor = vec3(0.55, 0.50, 0.35);
     float sandBlend = smoothstep(0.06, 0.01, shoreDist);
     vec3 shoreColor = mix(sandColor, wetSandColor, clamp(v_eta * 2.0 + 0.5, 0.0, 1.0));
     
-    // Sand caustics in shallow water near shore
+    // Sand caustics
     float causticsPattern = 0.0;
     if (shoreZone > 0.0) {
-      // Animated caustic pattern from overlapping sine waves
       float c1 = sin(v_worldPos.x * 3.0 + v_worldPos.z * 2.0 + u_time * 2.0);
       float c2 = sin(v_worldPos.x * 2.5 - v_worldPos.z * 3.5 + u_time * 1.7);
       float c3 = sin(v_worldPos.x * 1.8 + v_worldPos.z * 4.0 - u_time * 2.3);
       causticsPattern = pow(max(0.0, (c1 + c2 + c3) / 3.0), 2.0);
-      causticsPattern *= shoreZone * smoothstep(0.0, 0.05, shoreDist); // fade at very edge
+      causticsPattern *= shoreZone * smoothstep(0.0, 0.05, shoreDist);
     }
     
-    // Shallow water color shift (wave refraction effect)
     if (shoreZone > 0.0) {
-      // Water gets more turquoise/green in shallows
       vec3 shallowTint = vec3(0.15, 0.55, 0.50);
       waterSurface = mix(waterSurface, shallowTint * (wrap * 0.8 + 0.4), shoreZone * 0.5);
-      // Add caustics
       waterSurface += vec3(0.8, 0.9, 1.0) * causticsPattern * 0.3 * shoreZone;
     }
     
-    // Combine water, foam, and shore
     vec3 finalColor = mix(waterSurface, foamColor, totalFoam);
     finalColor = mix(finalColor, shoreColor, sandBlend * (1.0 - clamp(v_eta * 5.0 + 0.5, 0.0, 1.0)));
     
-    // Atmospheric distance fog
-    float fogFactor = 1.0 - exp(-v_distToCamera * 0.002);
-    fogFactor = clamp(fogFactor, 0.0, 0.85);
-    vec3 fogColor = getSkyColor(vec3(0.0, 0.1, 1.0));
-    finalColor = mix(finalColor, fogColor, fogFactor);
+    // ── Atmospheric Perspective (Rayleigh/Mie fog) ──
+    vec3 viewDir = normalize(v_worldPos - u_cameraPos);
+    float dist = v_distToCamera;
     
-    // Tone mapping (Reinhard)
-    finalColor = finalColor / (finalColor + vec3(1.0));
-    // Gamma correction
-    finalColor = pow(finalColor, vec3(1.0 / 2.2));
+    // Rayleigh extinction
+    vec3 betaR = vec3(5.8e-6, 13.5e-6, 33.1e-6) * u_rayleighScale;
+    float betaM = u_turbidity * 2e-6;
+    vec3 extinction = exp(-(betaR + vec3(betaM * 1.1)) * dist * 0.0003);
+    
+    // Inscattered fog color
+    float cosTheta = dot(viewDir, L);
+    float phaseR = (3.0 / (16.0 * 3.14159)) * (1.0 + cosTheta * cosTheta);
+    float g = 0.76;
+    float g2 = g * g;
+    float phaseM = (1.0 - g2) / (4.0 * 3.14159 * pow(1.0 + g2 - 2.0 * g * cosTheta, 1.5));
+    float sunFadeF = clamp(L.y * 3.0 + 0.3, 0.0, 1.0);
+    vec3 inscatter = (betaR * phaseR + vec3(betaM) * phaseM) * sunFadeF * 25.0;
+    
+    finalColor = finalColor * extinction + inscatter * (vec3(1.0) - extinction);
+    
+    // Tone mapping (ACES filmic)
+    finalColor = finalColor * 0.6;
+    vec3 a = finalColor * (finalColor + vec3(0.0245786)) - vec3(0.000090537);
+    vec3 b = finalColor * (0.983729 * finalColor + vec3(0.4329510)) + vec3(0.238081);
+    finalColor = a / b;
+    
+    // Gamma
+    finalColor = pow(max(finalColor, vec3(0.0)), vec3(1.0 / 2.2));
     
     gl_FragColor = vec4(finalColor, 1.0);
   }
@@ -483,51 +550,7 @@ export const DEBUG_VIS_FRAG = `
 // ═══════════════════════════════════════════════════════════════
 // SKY DOME SHADER
 // ═══════════════════════════════════════════════════════════════
-export const SKY_VERT = `
-  varying vec3 v_worldDir;
-  void main() {
-    v_worldDir = gl_Vertex.xyz;
-    vec4 pos = gl_ModelViewProjectionMatrix * vec4(gl_Vertex.xyz * 1000.0, 1.0);
-    gl_Position = vec4(pos.xy, pos.w, pos.w); // force to far plane
-  }
-`;
-
-export const SKY_FRAG = `
-  uniform vec3 u_sunDir;
-  uniform vec3 u_sunColor;
-  varying vec3 v_worldDir;
-  
-  void main() {
-    vec3 dir = normalize(v_worldDir);
-    
-    float sunFade = clamp(1.0 - exp(-u_sunDir.y * 10.0), 0.0, 1.0);
-    float skyFade = max(dir.y, 0.0);
-    
-    // Sky gradient  
-    vec3 skyTop = vec3(0.2, 0.4, 0.8) * sunFade;
-    vec3 skyHorizon = vec3(0.6, 0.7, 0.8) * sunFade;
-    vec3 sky = mix(skyHorizon, skyTop, pow(skyFade, 0.5));
-    
-    // Sun glow
-    float sunAngle = max(dot(dir, u_sunDir), 0.0);
-    vec3 sunGlow = vec3(1.0, 0.7, 0.3) * pow(sunAngle, 8.0) * sunFade;
-    sky += sunGlow * 0.6;
-    
-    // Sun disc
-    sky += u_sunColor * pow(sunAngle, 4096.0) * 15.0;
-    
-    // Below horizon: dark
-    if (dir.y < 0.0) {
-      sky = mix(skyHorizon * sunFade, vec3(0.01, 0.03, 0.05), clamp(-dir.y * 5.0, 0.0, 1.0));
-    }
-    
-    // Tone map
-    sky = sky / (sky + vec3(1.0));
-    sky = pow(sky, vec3(1.0 / 2.2));
-    
-    gl_FragColor = vec4(sky, 1.0);
-  }
-`;
+export { ATMOSPHERE_SKY_VERT as SKY_VERT, ATMOSPHERE_SKY_FRAG as SKY_FRAG } from './atmosphereShaders';
 
 // ═══════════════════════════════════════════════════════════════
 // SPHERE SHADER (interactive object)
@@ -589,6 +612,7 @@ export const SPHERE_FRAG = `
   }
 `;
 
+// Re-exported from atmosphereShaders via named exports above (SKY_VERT, SKY_FRAG)
 export default {
   FULLSCREEN_VERT,
   SWE_UPDATE_FRAG,
@@ -598,8 +622,6 @@ export default {
   OCEAN_SURFACE_FRAG,
   CLEAR_FRAG,
   DEBUG_VIS_FRAG,
-  SKY_VERT,
-  SKY_FRAG,
   SPHERE_VERT,
   SPHERE_FRAG,
 };

@@ -25,6 +25,7 @@ export function HyperOceanScene() {
     setDebugMode,
     toggleAutoWaves,
     toggleFeature,
+    setAtmosphereParam,
   } = useHyperOcean(canvasRef);
 
   // Mouse handlers
@@ -155,6 +156,12 @@ export function HyperOceanScene() {
           hullEnabled={state.hullEnabled}
           sprayEnabled={state.sprayEnabled}
           gerstnerEnabled={state.gerstnerEnabled}
+          windSpeed={state.windSpeed}
+          fetch={state.fetch}
+          turbidity={state.turbidity}
+          rayleighScale={state.rayleighScale}
+          mieCoeff={state.mieCoeff}
+          sunIntensity={state.sunIntensity}
           onSettingsChange={updateSettings}
           onCloudSettingsChange={updateCloudSettings}
           onPresetChange={setPreset}
@@ -164,6 +171,7 @@ export function HyperOceanScene() {
           onDebugModeChange={setDebugMode}
           onToggleAutoWaves={toggleAutoWaves}
           onToggleFeature={toggleFeature}
+          onAtmosphereParamChange={setAtmosphereParam}
         />
       )}
 
