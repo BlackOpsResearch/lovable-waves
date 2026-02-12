@@ -37,6 +37,12 @@ interface OceanControlsProps {
   hullEnabled: boolean;
   sprayEnabled: boolean;
   gerstnerEnabled: boolean;
+  windSpeed: number;
+  fetch: number;
+  turbidity: number;
+  rayleighScale: number;
+  mieCoeff: number;
+  sunIntensity: number;
   onSettingsChange: (settings: Partial<OceanSettings>) => void;
   onCloudSettingsChange: (settings: Partial<CloudSettings>) => void;
   onPresetChange: (preset: string) => void;
@@ -46,6 +52,7 @@ interface OceanControlsProps {
   onDebugModeChange: (mode: number) => void;
   onToggleAutoWaves: () => void;
   onToggleFeature: (feature: 'sheet' | 'hull' | 'spray' | 'gerstner') => void;
+  onAtmosphereParamChange: (param: string, value: number) => void;
 }
 
 export function OceanControls({
@@ -61,6 +68,12 @@ export function OceanControls({
   hullEnabled,
   sprayEnabled,
   gerstnerEnabled,
+  windSpeed,
+  fetch: fetchDist,
+  turbidity,
+  rayleighScale,
+  mieCoeff,
+  sunIntensity,
   onSettingsChange,
   onCloudSettingsChange,
   onPresetChange,
@@ -70,6 +83,7 @@ export function OceanControls({
   onDebugModeChange,
   onToggleAutoWaves,
   onToggleFeature,
+  onAtmosphereParamChange,
 }: OceanControlsProps) {
   const [isExpanded, setIsExpanded] = useState(true);
   const [activeTab, setActiveTab] = useState('waves');
@@ -144,25 +158,42 @@ export function OceanControls({
           {/* Tabbed Controls */}
           <Tabs value={activeTab} onValueChange={setActiveTab}>
             <TabsList className="w-full grid grid-cols-5">
-              <TabsTrigger value="waves" className="text-xs">
+              <TabsTrigger value="waves" className="text-xs" title="Waves & JONSWAP">
                 <Waves className="w-3 h-3" />
               </TabsTrigger>
-              <TabsTrigger value="sun" className="text-xs">
+              <TabsTrigger value="sun" className="text-xs" title="Sun & Atmosphere">
                 <Sun className="w-3 h-3" />
               </TabsTrigger>
-              <TabsTrigger value="clouds" className="text-xs">
+              <TabsTrigger value="clouds" className="text-xs" title="Clouds">
                 <CloudSun className="w-3 h-3" />
               </TabsTrigger>
-              <TabsTrigger value="water" className="text-xs">
+              <TabsTrigger value="water" className="text-xs" title="Water Material">
                 <Palette className="w-3 h-3" />
               </TabsTrigger>
-              <TabsTrigger value="debug" className="text-xs">
+              <TabsTrigger value="debug" className="text-xs" title="Debug">
                 <Bug className="w-3 h-3" />
               </TabsTrigger>
             </TabsList>
 
             {/* Waves Tab */}
             <TabsContent value="waves" className="space-y-4 mt-4">
+              <label className="text-[10px] text-muted-foreground font-semibold block uppercase tracking-wider">JONSWAP Spectrum</label>
+              <ControlSlider
+                label="Wind Speed (m/s)"
+                value={windSpeed}
+                min={0.5}
+                max={25}
+                step={0.5}
+                onChange={(v) => onAtmosphereParamChange('windSpeed', v)}
+              />
+              <ControlSlider
+                label="Fetch (km)"
+                value={fetchDist / 1000}
+                min={1}
+                max={500}
+                step={5}
+                onChange={(v) => onAtmosphereParamChange('fetch', v * 1000)}
+              />
               <ControlSlider
                 label="Wave Height"
                 value={settings.waves.amplitude}
@@ -197,7 +228,7 @@ export function OceanControls({
               />
             </TabsContent>
 
-            {/* Sun Tab */}
+            {/* Sun & Atmosphere Tab */}
             <TabsContent value="sun" className="space-y-4 mt-4">
               <ControlSlider
                 label="Sun Elevation"
@@ -215,21 +246,38 @@ export function OceanControls({
                 step={5}
                 onChange={(v) => onSunPositionChange(settings.atmosphere.sunElevation, v)}
               />
+              <label className="text-[10px] text-muted-foreground font-semibold block uppercase tracking-wider mt-2">Rayleigh / Mie Scattering</label>
               <ControlSlider
                 label="Turbidity"
-                value={settings.atmosphere.turbidity}
+                value={turbidity}
                 min={1}
                 max={20}
                 step={0.5}
-                onChange={(v) => onSettingsChange({ atmosphere: { ...settings.atmosphere, turbidity: v } })}
+                onChange={(v) => onAtmosphereParamChange('turbidity', v)}
               />
               <ControlSlider
-                label="Rayleigh"
-                value={settings.atmosphere.rayleigh}
-                min={0}
+                label="Rayleigh Scale"
+                value={rayleighScale}
+                min={0.1}
                 max={4}
                 step={0.1}
-                onChange={(v) => onSettingsChange({ atmosphere: { ...settings.atmosphere, rayleigh: v } })}
+                onChange={(v) => onAtmosphereParamChange('rayleighScale', v)}
+              />
+              <ControlSlider
+                label="Mie Coefficient"
+                value={mieCoeff}
+                min={0.001}
+                max={0.1}
+                step={0.001}
+                onChange={(v) => onAtmosphereParamChange('mieCoeff', v)}
+              />
+              <ControlSlider
+                label="Sun Intensity"
+                value={sunIntensity}
+                min={1}
+                max={50}
+                step={1}
+                onChange={(v) => onAtmosphereParamChange('sunIntensity', v)}
               />
             </TabsContent>
 

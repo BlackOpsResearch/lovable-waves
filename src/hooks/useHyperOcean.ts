@@ -36,6 +36,12 @@ export interface OceanState {
   hullEnabled: boolean;
   sprayEnabled: boolean;
   gerstnerEnabled: boolean;
+  windSpeed: number;
+  fetch: number;
+  turbidity: number;
+  rayleighScale: number;
+  mieCoeff: number;
+  sunIntensity: number;
 }
 
 export function useHyperOcean(canvasRef: React.RefObject<HTMLCanvasElement | null>) {
@@ -58,6 +64,12 @@ export function useHyperOcean(canvasRef: React.RefObject<HTMLCanvasElement | nul
     hullEnabled: true,
     sprayEnabled: true,
     gerstnerEnabled: true,
+    windSpeed: 8.0,
+    fetch: 100000,
+    turbidity: 2.0,
+    rayleighScale: 1.0,
+    mieCoeff: 0.005,
+    sunIntensity: 22.0,
   });
   
   // Camera
@@ -292,6 +304,7 @@ export function useHyperOcean(canvasRef: React.RefObject<HTMLCanvasElement | nul
     if (engineRef.current) {
       const sunPos = calculateSunPosition(elevation, azimuth);
       engineRef.current.setSunDirection(new Vector(sunPos[0], sunPos[1], sunPos[2]));
+      engineRef.current.sunElevation = elevation * Math.PI / 180;
       setState(prev => ({
         ...prev,
         settings: { ...prev.settings, atmosphere: { ...prev.settings.atmosphere, sunElevation: elevation, sunAzimuth: azimuth } }
@@ -310,6 +323,37 @@ export function useHyperOcean(canvasRef: React.RefObject<HTMLCanvasElement | nul
     if (engineRef.current) {
       engineRef.current.autoWavesEnabled = !engineRef.current.autoWavesEnabled;
       setState(prev => ({ ...prev, autoWaves: engineRef.current?.autoWavesEnabled ?? true }));
+    }
+  }, []);
+
+  const setAtmosphereParam = useCallback((param: string, value: number) => {
+    const engine = engineRef.current;
+    if (!engine) return;
+    switch (param) {
+      case 'windSpeed':
+        engine.windSpeed = value;
+        setState(prev => ({ ...prev, windSpeed: value }));
+        break;
+      case 'fetch':
+        engine.fetch = value;
+        setState(prev => ({ ...prev, fetch: value }));
+        break;
+      case 'turbidity':
+        engine.turbidity = value;
+        setState(prev => ({ ...prev, turbidity: value }));
+        break;
+      case 'rayleighScale':
+        engine.rayleighScale = value;
+        setState(prev => ({ ...prev, rayleighScale: value }));
+        break;
+      case 'mieCoeff':
+        engine.mieCoeff = value;
+        setState(prev => ({ ...prev, mieCoeff: value }));
+        break;
+      case 'sunIntensity':
+        engine.sunIntensity = value;
+        setState(prev => ({ ...prev, sunIntensity: value }));
+        break;
     }
   }, []);
 
@@ -391,7 +435,7 @@ export function useHyperOcean(canvasRef: React.RefObject<HTMLCanvasElement | nul
   return {
     state, handlePointerStart, handlePointerMove, handlePointerEnd, handleWheel,
     toggleGravity, togglePause, setPreset, updateSettings, updateCloudSettings, setSunPosition,
-    setDebugMode, toggleAutoWaves, toggleFeature,
+    setDebugMode, toggleAutoWaves, toggleFeature, setAtmosphereParam,
   };
 }
 

@@ -13,6 +13,7 @@ import { Mesh } from '../webgl/Mesh';
 import { Vector } from '../webgl/Vector';
 import { Raytracer } from '../webgl/Raytracer';
 import { OpusConfig, DEFAULT_OPUS_CONFIG } from './OpusConfig';
+import { computeJONSWAPHeight } from './shaders/jonswapSpectrum';
 import { SpraySystem } from './SpraySystem';
 import {
   FULLSCREEN_VERT,
@@ -111,6 +112,16 @@ export class OpusEngine {
   gerstnerAmplitude: number = 0.3;
   gerstnerSteepness: number = 0.4;
   windDirection: number = 45;
+  windSpeed: number = 8.0;     // m/s — drives JONSWAP spectrum
+  fetch: number = 100000.0;    // meters — wave development distance
+  
+  // Atmosphere parameters
+  turbidity: number = 2.0;
+  rayleighScale: number = 1.0;
+  mieCoeff: number = 0.005;
+  mieG: number = 0.8;
+  sunIntensity: number = 22.0;
+  sunElevation: number = 0.785; // radians (~45°)
   
   // Sphere
   sphereCenter: Vector = new Vector(0, 0.5, 0);
@@ -494,6 +505,12 @@ export class OpusEngine {
     this.skyShader.uniforms({
       u_sunDir: this.sunDir,
       u_sunColor: cfg.render.sunColor,
+      u_sunIntensity: this.sunIntensity,
+      u_turbidity: this.turbidity,
+      u_rayleighScale: this.rayleighScale,
+      u_mieCoeff: this.mieCoeff,
+      u_mieG: this.mieG,
+      u_sunElevation: this.sunElevation,
     }).draw(this.skyMesh);
     gl.depthMask(true);
     
@@ -528,6 +545,11 @@ export class OpusEngine {
       u_gerstnerAmp: this.gerstnerEnabled ? this.gerstnerAmplitude : 0,
       u_gerstnerSteep: this.gerstnerSteepness,
       u_windDir: this.windDirection,
+      u_windSpeed: this.windSpeed,
+      u_fetch: this.fetch,
+      u_turbidity: this.turbidity,
+      u_rayleighScale: this.rayleighScale,
+      u_sunIntensity: this.sunIntensity,
     }).draw(this.oceanMesh);
     
     gl.disable(gl.CULL_FACE);
@@ -685,22 +707,13 @@ export class OpusEngine {
   getHeightAt(worldX: number, worldZ: number): number {
     let h = this.readHeightAt(worldX, worldZ);
     
-    // Add Gerstner contribution
+    // Add JONSWAP-driven Gerstner contribution
     if (this.gerstnerEnabled && this.gerstnerAmplitude > 0.001) {
-      const windRad = this.windDirection * Math.PI / 180;
-      const wd = [Math.cos(windRad), Math.sin(windRad)];
-      
-      const gerstnerWave = (pos: number[], t: number, dir: number[], wl: number, amp: number) => {
-        const k = 2 * Math.PI / wl;
-        const c = Math.sqrt(9.81 / k);
-        const f = k * (dir[0] * pos[0] + dir[1] * pos[1] - c * t);
-        return amp * Math.sin(f);
-      };
-      
-      const pos = [worldX, worldZ];
-      h += gerstnerWave(pos, this.time, wd, 60, this.gerstnerAmplitude * 1.2);
-      h += gerstnerWave(pos, this.time * 1.1, [wd[0] + 0.3, wd[1] - 0.2], 40, this.gerstnerAmplitude * 0.8);
-      h += gerstnerWave(pos, this.time * 1.2, [-wd[1] * 0.7 + wd[0] * 0.3, wd[0] * 0.7 + wd[1] * 0.3], 25, this.gerstnerAmplitude * 0.5);
+      h += computeJONSWAPHeight(
+        worldX, worldZ, this.time,
+        this.windSpeed, this.windDirection, this.fetch,
+        this.gerstnerAmplitude
+      );
     }
     
     return h;
