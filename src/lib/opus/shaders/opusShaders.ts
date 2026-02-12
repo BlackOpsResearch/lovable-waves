@@ -369,7 +369,50 @@ export const OCEAN_SURFACE_FRAG = `
     
     // Combine
     vec3 waterSurface = diffuse + specular + envColor + sssColor;
+    
+    // ── Shore/Beach System ──
+    // Shore detection: edges of the simulation domain act as shoreline
+    vec2 shoreUV = v_uv;
+    float shoreDist = min(min(shoreUV.x, 1.0 - shoreUV.x), min(shoreUV.y, 1.0 - shoreUV.y));
+    float shoreZone = smoothstep(0.12, 0.02, shoreDist);
+    
+    // Shallow water depth for shore
+    float shoreDepth = shoreDist * 20.0; // depth decreases near shore
+    
+    // Shore foam accumulation (waves pile up at shore)
+    float shoreFoam = shoreZone * (0.3 + 0.5 * abs(sin(v_worldPos.x * 0.5 + u_time * 1.5)))
+                    * (0.5 + v_steepness * 2.0);
+    totalFoam = max(totalFoam, shoreFoam);
+    
+    // Sand color blending near shore
+    vec3 sandColor = vec3(0.76, 0.70, 0.50);
+    vec3 wetSandColor = vec3(0.55, 0.50, 0.35);
+    float sandBlend = smoothstep(0.06, 0.01, shoreDist);
+    vec3 shoreColor = mix(sandColor, wetSandColor, clamp(v_eta * 2.0 + 0.5, 0.0, 1.0));
+    
+    // Sand caustics in shallow water near shore
+    float causticsPattern = 0.0;
+    if (shoreZone > 0.0) {
+      // Animated caustic pattern from overlapping sine waves
+      float c1 = sin(v_worldPos.x * 3.0 + v_worldPos.z * 2.0 + u_time * 2.0);
+      float c2 = sin(v_worldPos.x * 2.5 - v_worldPos.z * 3.5 + u_time * 1.7);
+      float c3 = sin(v_worldPos.x * 1.8 + v_worldPos.z * 4.0 - u_time * 2.3);
+      causticsPattern = pow(max(0.0, (c1 + c2 + c3) / 3.0), 2.0);
+      causticsPattern *= shoreZone * smoothstep(0.0, 0.05, shoreDist); // fade at very edge
+    }
+    
+    // Shallow water color shift (wave refraction effect)
+    if (shoreZone > 0.0) {
+      // Water gets more turquoise/green in shallows
+      vec3 shallowTint = vec3(0.15, 0.55, 0.50);
+      waterSurface = mix(waterSurface, shallowTint * (wrap * 0.8 + 0.4), shoreZone * 0.5);
+      // Add caustics
+      waterSurface += vec3(0.8, 0.9, 1.0) * causticsPattern * 0.3 * shoreZone;
+    }
+    
+    // Combine water, foam, and shore
     vec3 finalColor = mix(waterSurface, foamColor, totalFoam);
+    finalColor = mix(finalColor, shoreColor, sandBlend * (1.0 - clamp(v_eta * 5.0 + 0.5, 0.0, 1.0)));
     
     // Atmospheric distance fog
     float fogFactor = 1.0 - exp(-v_distToCamera * 0.002);

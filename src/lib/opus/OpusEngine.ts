@@ -61,7 +61,7 @@ export class OpusEngine {
   diagTex: Texture;     // Diagnostics (steepness, curvature, jacobian, etaRate)
   foamPP: PingPong;     // Foam density
   sheetPP: PingPong;    // Sheet topology (seamState, thickness, viscosity, pressure)
-  hullTex: Texture;     // Hull displacement field (displacement, wake, bow, spray_src)
+  hullPP: PingPong;     // Hull displacement field (displacement, wake, bow, spray_src)
   
   // Shaders
   sweShader: Shader;
@@ -132,7 +132,7 @@ export class OpusEngine {
     this.diagTex = this.createSimTexture(HR, HR);
     this.foamPP = this.createPingPong(HR, HR);
     this.sheetPP = this.createPingPong(SR, SR);
-    this.hullTex = this.createSimTexture(HR, HR);
+    this.hullPP = this.createPingPong(HR, HR);
     
     // Create meshes
     this.fsQuad = Mesh.plane(gl);
@@ -195,6 +195,34 @@ export class OpusEngine {
   private createSimTexture(w: number, h: number): Texture {
     const gl = this.gl;
     const useFloat = Texture.canUseFloatingPointTextures(gl);
+    
+    if (gl.isWebGL2) {
+      const gl2 = gl as WebGL2RenderingContext;
+      // Try RGBA32F first
+      try {
+        const filter = gl.hasFloatLinear ? gl.LINEAR : gl.NEAREST;
+        const tex = new Texture(gl, w, h, { 
+          type: gl.FLOAT, 
+          format: gl.RGBA, 
+          internalFormat: gl2.RGBA32F, 
+          filter 
+        });
+        if (tex.canDrawTo()) return tex;
+      } catch (e) { /* fall through */ }
+      
+      // Try RGBA16F
+      try {
+        const tex = new Texture(gl, w, h, { 
+          type: gl2.HALF_FLOAT, 
+          format: gl.RGBA, 
+          internalFormat: gl2.RGBA16F, 
+          filter: gl.LINEAR 
+        });
+        if (tex.canDrawTo()) return tex;
+      } catch (e) { /* fall through */ }
+    }
+    
+    // WebGL1 fallback
     const type = useFloat ? gl.FLOAT : gl.HALF_FLOAT_OES;
     const filter = (useFloat && Texture.canUseFloatingPointLinearFiltering(gl)) ? gl.LINEAR : gl.NEAREST;
     
@@ -232,7 +260,8 @@ export class OpusEngine {
     this.clearTexture(this.diagTex, 0, 0, 0, 0);
     this.clearTexture(this.foamPP.a, 0, 0, 0, 0);
     this.clearTexture(this.foamPP.b, 0, 0, 0, 0);
-    this.clearTexture(this.hullTex, 0, 0, 0, 0);
+    this.clearTexture(this.hullPP.a, 0, 0, 0, 0);
+    this.clearTexture(this.hullPP.b, 0, 0, 0, 0);
   }
   
   private runPass(shader: Shader, target: Texture, uniforms: Record<string, unknown>) {
@@ -365,12 +394,10 @@ export class OpusEngine {
     // PASS 5: Hull Contact
     // ═══════════════════════════════════════════════
     if (this.hullEnabled) {
-      this.hullTex.bind(0);
+      this.hullPP.read.bind(0);
       this.hfPP.read.bind(1);
       
-      // Create a temp texture for hull output
-      const hullOut = this.createSimTexture(HR, HR);
-      this.runPass(this.hullShader, hullOut, {
+      this.runPass(this.hullShader, this.hullPP.write, {
         u_hull: 0,
         u_hf: 1,
         u_res: [HR, HR],
@@ -383,12 +410,11 @@ export class OpusEngine {
         u_barrierStiffness: cfg.sheet.barrierStiffness,
         u_slapDamping: cfg.sheet.slapDamping,
       });
-      // Swap hull textures
-      this.hullTex.swapWith(hullOut);
+      this.hullPP.swap();
       
       // PASS 6: Hull → HF Feedback
       this.hfPP.read.bind(0);
-      this.hullTex.bind(1);
+      this.hullPP.read.bind(1);
       this.runPass(this.hullFeedbackShader, this.hfPP.write, {
         u_hf: 0,
         u_hull: 1,
@@ -406,7 +432,7 @@ export class OpusEngine {
     this.hfPP.read.bind(1);
     this.diagTex.bind(2);
     this.sheetPP.read.bind(3);
-    this.hullTex.bind(4);
+    this.hullPP.read.bind(4);
     this.runPass(this.foamShader, this.foamPP.write, {
       u_foam: 0,
       u_hf: 1,
@@ -477,7 +503,7 @@ export class OpusEngine {
     this.hfPP.read.bind(0);
     this.diagTex.bind(1);
     this.foamPP.read.bind(2);
-    this.hullTex.bind(3);
+    this.hullPP.read.bind(3);
     
     gl.enable(gl.CULL_FACE);
     gl.cullFace(gl.BACK);
@@ -537,7 +563,7 @@ export class OpusEngine {
       const debugTex = this.debugMode === 3 ? this.foamPP.read : 
                         this.debugMode === 0 ? this.hfPP.read :
                         this.debugMode === 4 ? this.sheetPP.read :
-                        this.debugMode === 5 ? this.hullTex : this.diagTex;
+                        this.debugMode === 5 ? this.hullPP.read : this.diagTex;
       debugTex.bind(0);
       this.debugShader.uniforms({
         u_tex: 0,
@@ -625,9 +651,62 @@ export class OpusEngine {
   getDiagnosticsTexture(): Texture { return this.diagTex; }
   getFoamTexture(): Texture { return this.foamPP.read; }
   getSheetTexture(): Texture { return this.sheetPP.read; }
-  getHullTexture(): Texture { return this.hullTex; }
+  getHullTexture(): Texture { return this.hullPP.read; }
   
-  getApproxHeight(_worldX: number, _worldZ: number): number { return 0; }
+  /**
+   * GPU readback: read heightfield value at a world position
+   * Returns the water surface height (η) at the given XZ coordinate
+   */
+  readHeightAt(worldX: number, worldZ: number): number {
+    const gl = this.gl;
+    const cfg = this.config;
+    const HR = cfg.hf.resolution;
+    
+    // Convert world coords to UV
+    const u = (worldX / cfg.hf.worldSize) + 0.5;
+    const v = (worldZ / cfg.hf.worldSize) + 0.5;
+    
+    // Clamp to valid range
+    const px = Math.max(0, Math.min(HR - 1, Math.floor(u * HR)));
+    const py = Math.max(0, Math.min(HR - 1, Math.floor(v * HR)));
+    
+    // Read single pixel from heightfield texture
+    const pixels = new Float32Array(4);
+    this.hfPP.read.drawTo(() => {
+      gl.readPixels(px, py, 1, 1, gl.RGBA, gl.FLOAT, pixels);
+    });
+    
+    return pixels[0]; // η value
+  }
+  
+  /**
+   * Get combined height including Gerstner contribution at a world position
+   */
+  getHeightAt(worldX: number, worldZ: number): number {
+    let h = this.readHeightAt(worldX, worldZ);
+    
+    // Add Gerstner contribution
+    if (this.gerstnerEnabled && this.gerstnerAmplitude > 0.001) {
+      const windRad = this.windDirection * Math.PI / 180;
+      const wd = [Math.cos(windRad), Math.sin(windRad)];
+      
+      const gerstnerWave = (pos: number[], t: number, dir: number[], wl: number, amp: number) => {
+        const k = 2 * Math.PI / wl;
+        const c = Math.sqrt(9.81 / k);
+        const f = k * (dir[0] * pos[0] + dir[1] * pos[1] - c * t);
+        return amp * Math.sin(f);
+      };
+      
+      const pos = [worldX, worldZ];
+      h += gerstnerWave(pos, this.time, wd, 60, this.gerstnerAmplitude * 1.2);
+      h += gerstnerWave(pos, this.time * 1.1, [wd[0] + 0.3, wd[1] - 0.2], 40, this.gerstnerAmplitude * 0.8);
+      h += gerstnerWave(pos, this.time * 1.2, [-wd[1] * 0.7 + wd[0] * 0.3, wd[0] * 0.7 + wd[1] * 0.3], 25, this.gerstnerAmplitude * 0.5);
+    }
+    
+    return h;
+  }
+  
+  getApproxHeight(_worldX: number, _worldZ: number): number { return this.getHeightAt(_worldX, _worldZ); }
   
   setSunDirection(dir: Vector) { this.sunDir = dir.unit(); }
   
