@@ -120,7 +120,7 @@ export class OpusEngine {
   rayleighScale: number = 1.0;
   mieCoeff: number = 0.005;
   mieG: number = 0.8;
-  sunIntensity: number = 22.0;
+  sunIntensity: number = 5.0;
   sunElevation: number = 0.785; // radians (~45°)
   
   // Sphere

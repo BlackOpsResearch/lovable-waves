@@ -9,6 +9,7 @@ import { Vector } from '../lib/webgl/Vector';
 import { Raytracer } from '../lib/webgl/Raytracer';
 import { OpusEngine } from '../lib/opus/OpusEngine';
 import { DEFAULT_OPUS_CONFIG } from '../lib/opus/OpusConfig';
+import { computeJONSWAPHeight } from '../lib/opus/shaders/jonswapSpectrum';
 import { 
   OceanSettings, 
   DEFAULT_OCEAN_SETTINGS, 
@@ -69,7 +70,7 @@ export function useHyperOcean(canvasRef: React.RefObject<HTMLCanvasElement | nul
     turbidity: 2.0,
     rayleighScale: 1.0,
     mieCoeff: 0.005,
-    sunIntensity: 22.0,
+    sunIntensity: 5.0,
   });
   
   // Camera
@@ -118,17 +119,18 @@ export function useHyperOcean(canvasRef: React.RefObject<HTMLCanvasElement | nul
     if (!engine) return;
     if (seconds > 1) return;
     
-    // Sphere physics with GPU-readback buoyancy
+    // Sphere physics with buoyancy (only when gravity enabled)
     if (modeRef.current === MODE_MOVE_SPHERE) {
       velocityRef.current = new Vector();
     } else if (useSpherePhysicsRef.current) {
       const center = centerRef.current;
       const radius = radiusRef.current;
       
-      // Read actual water height at sphere position from heightfield
-      const waterHeight = engine.getHeightAt(center.x, center.z);
+      // Use approximate height (no GPU readback — avoids GPU stall)
+      // Gerstner-only estimation is fast and stall-free
+      const waterHeight = engine.gerstnerEnabled ? 
+        computeJONSWAPHeight(center.x, center.z, engine.time, engine.windSpeed, engine.windDirection, engine.fetch, engine.gerstnerAmplitude) : 0;
       
-      // Calculate submersion based on actual wave surface
       const sphereBottom = center.y - radius;
       const submersionDepth = Math.max(0, waterHeight - sphereBottom);
       const percentUnderWater = Math.max(0, Math.min(1, submersionDepth / (2 * radius)));
@@ -138,11 +140,11 @@ export function useHyperOcean(canvasRef: React.RefObject<HTMLCanvasElement | nul
         gravityRef.current.multiply(seconds)
       );
       
-      // Buoyancy force proportional to displaced volume (Archimedes)
-      const buoyancyForce = percentUnderWater * 1.8 * 9.81; // ~1.8x water density compensation
+      // Buoyancy (Archimedes)
+      const buoyancyForce = percentUnderWater * 1.8 * 9.81;
       velocityRef.current.y += buoyancyForce * seconds;
       
-      // Water drag (stronger when submerged)
+      // Water drag
       const dragCoeff = 0.5 + percentUnderWater * 3.0;
       const speed = velocityRef.current.length();
       if (speed > 0.001) {
@@ -155,9 +157,9 @@ export function useHyperOcean(canvasRef: React.RefObject<HTMLCanvasElement | nul
       // Apply velocity
       centerRef.current = center.add(velocityRef.current.multiply(seconds));
       
-      // Wave-following: gently push sphere to match wave surface when floating
+      // Wave-following
       if (percentUnderWater > 0.1 && percentUnderWater < 0.9) {
-        const targetY = waterHeight + radius * 0.3; // float ~30% above surface
+        const targetY = waterHeight + radius * 0.3;
         const followStrength = 2.0 * seconds;
         centerRef.current.y += (targetY - centerRef.current.y) * followStrength;
       }
