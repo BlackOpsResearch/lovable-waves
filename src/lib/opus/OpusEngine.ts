@@ -183,6 +183,9 @@ export class OpusEngine {
     this.clearTexture(this.sheetPP.a, 0, 1, 0, 0);
     this.clearTexture(this.sheetPP.b, 0, 1, 0, 0);
     
+    // CRITICAL: Restore clear color after texture init (clearTexture changes it)
+    gl.clearColor(0, 0, 0, 1);
+    
     console.log(`OPUS Engine initialized: HF=${HR}², Sheet=${SR}², Spray=${config.spray.max}, Gerstner=ON`);
   }
   
@@ -258,11 +261,13 @@ export class OpusEngine {
   }
   
   private clearTexture(tex: Texture, r: number, g: number, b: number, a: number) {
-    const self = this;
+    const gl = this.gl;
     tex.drawTo(() => {
-      self.gl.clearColor(r, g, b, a);
-      self.gl.clear(self.gl.COLOR_BUFFER_BIT);
+      gl.clearColor(r, g, b, a);
+      gl.clear(gl.COLOR_BUFFER_BIT);
     });
+    // Restore clear color to black after each texture clear
+    gl.clearColor(0, 0, 0, 1);
   }
   
   private clearAllTextures() {
@@ -499,8 +504,9 @@ export class OpusEngine {
     gl.enable(gl.DEPTH_TEST);
     
     // ═══════════════════════════════════════════════
-    // Sky dome
+    // Sky dome (disable depth test so it always renders as background)
     // ═══════════════════════════════════════════════
+    gl.disable(gl.DEPTH_TEST);
     gl.depthMask(false);
     this.skyShader.uniforms({
       u_sunDir: this.sunDir,
@@ -513,6 +519,7 @@ export class OpusEngine {
       u_sunElevation: this.sunElevation,
     }).draw(this.skyMesh);
     gl.depthMask(true);
+    gl.enable(gl.DEPTH_TEST);
     
     // ═══════════════════════════════════════════════
     // Ocean surface (with Gerstner blend)
