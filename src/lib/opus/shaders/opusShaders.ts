@@ -401,31 +401,31 @@ export const OCEAN_SURFACE_FRAG = `
     float F = schlickFresnel(N, V, 0.02);
     
     // Water base color from depth
-    float depthFactor = smoothstep(-3.0, 3.0, v_eta);
+    float depthFactor = smoothstep(-2.0, 2.0, v_eta);
     vec3 baseColor = mix(u_deepColor, u_shallowColor, depthFactor);
     
-    // Wrapped diffuse lighting
+    // Wrapped diffuse lighting (moderate intensity)
     float wrap = max((dot(N, L) + 0.3) / 1.3, 0.0);
-    vec3 diffuse = baseColor * wrap * u_sunColor * u_sunIntensity;
+    vec3 diffuse = baseColor * (wrap * u_sunIntensity * 0.5 + 0.15) * u_sunColor;
     
     // Specular (Blinn-Phong)
     float NdotH = max(dot(N, H), 0.0);
-    vec3 specular = u_sunColor * pow(NdotH, u_specPow) * F * u_sunIntensity;
+    vec3 specular = u_sunColor * pow(NdotH, u_specPow) * F * u_sunIntensity * 0.3;
     
     // Environment reflection
     vec3 reflDir = reflect(-V, N);
     vec3 skyRefl = getSkyColor(reflDir);
     vec3 envColor = skyRefl * F * u_envRefl;
     
-    // Subsurface scattering
+    // Subsurface scattering (ocean glow)
     float sss = pow(max(0.0, dot(-V, L)), 4.0);
-    vec3 sssColor = vec3(0.1, 0.4, 0.3) * sss * 0.3 * u_sunIntensity;
+    vec3 sssColor = vec3(0.05, 0.25, 0.2) * sss * 0.4 * u_sunIntensity * 0.3;
     
     // Foam
     float foamFromSteep = smoothstep(u_foamThresh, u_foamThresh + 0.15, v_steepness);
     float totalFoam = max(foamFromSteep, v_foam) * u_foamIntensity;
     totalFoam = clamp(totalFoam, 0.0, 1.0);
-    vec3 foamColor = vec3(0.9, 0.95, 1.0);
+    vec3 foamColor = vec3(0.85, 0.9, 0.95);
     
     // Combine
     vec3 waterSurface = diffuse + specular + envColor + sssColor;
@@ -455,7 +455,7 @@ export const OCEAN_SURFACE_FRAG = `
     }
     
     if (shoreZone > 0.0) {
-      vec3 shallowTint = vec3(0.15, 0.55, 0.50);
+      vec3 shallowTint = vec3(0.08, 0.35, 0.35);
       waterSurface = mix(waterSurface, shallowTint * (wrap * 0.8 + 0.4), shoreZone * 0.5);
       waterSurface += vec3(0.8, 0.9, 1.0) * causticsPattern * 0.3 * shoreZone;
     }
@@ -463,31 +463,29 @@ export const OCEAN_SURFACE_FRAG = `
     vec3 finalColor = mix(waterSurface, foamColor, totalFoam);
     finalColor = mix(finalColor, shoreColor, sandBlend * (1.0 - clamp(v_eta * 5.0 + 0.5, 0.0, 1.0)));
     
-    // ── Atmospheric Perspective (Rayleigh/Mie fog) ──
+    // ── Atmospheric Perspective (gentle fog) ──
     vec3 viewDir = normalize(v_worldPos - u_cameraPos);
     float dist = v_distToCamera;
     
-    // Rayleigh extinction
     vec3 betaR = vec3(5.8e-6, 13.5e-6, 33.1e-6) * u_rayleighScale;
     float betaM = u_turbidity * 2e-6;
-    vec3 extinction = exp(-(betaR + vec3(betaM * 1.1)) * dist * 0.0003);
+    vec3 extinction = exp(-(betaR + vec3(betaM * 1.1)) * dist * 0.0001);
     
-    // Inscattered fog color
-    float cosTheta = dot(viewDir, L);
-    float phaseR = (3.0 / (16.0 * 3.14159)) * (1.0 + cosTheta * cosTheta);
+    float cosT = dot(viewDir, L);
+    float phaseR = (3.0 / (16.0 * 3.14159)) * (1.0 + cosT * cosT);
     float g = 0.76;
     float g2 = g * g;
-    float phaseM = (1.0 - g2) / (4.0 * 3.14159 * pow(1.0 + g2 - 2.0 * g * cosTheta, 1.5));
+    float phaseM = (1.0 - g2) / (4.0 * 3.14159 * pow(1.0 + g2 - 2.0 * g * cosT, 1.5));
     float sunFadeF = clamp(L.y * 3.0 + 0.3, 0.0, 1.0);
-    vec3 inscatter = (betaR * phaseR + vec3(betaM) * phaseM) * sunFadeF * 25.0;
+    vec3 inscatter = (betaR * phaseR + vec3(betaM) * phaseM) * sunFadeF * 10.0;
     
     finalColor = finalColor * extinction + inscatter * (vec3(1.0) - extinction);
     
     // Tone mapping (ACES filmic)
-    finalColor = finalColor * 0.6;
+    finalColor *= 0.8;
     vec3 a = finalColor * (finalColor + vec3(0.0245786)) - vec3(0.000090537);
     vec3 b = finalColor * (0.983729 * finalColor + vec3(0.4329510)) + vec3(0.238081);
-    finalColor = a / b;
+    finalColor = max(a / b, vec3(0.0));
     
     // Gamma
     finalColor = pow(max(finalColor, vec3(0.0)), vec3(1.0 / 2.2));

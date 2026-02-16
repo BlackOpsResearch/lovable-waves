@@ -131,7 +131,7 @@ export const DEFAULT_OPUS_CONFIG: OpusConfig = {
     envReflection: 0.6,
     sunDir: [0.5, 0.7, -0.5],
     sunColor: [1.0, 0.95, 0.8],
-    deepColor: [0.01, 0.04, 0.08],
-    shallowColor: [0.05, 0.3, 0.4],
+    deepColor: [0.005, 0.03, 0.08],
+    shallowColor: [0.02, 0.18, 0.28],
   },
 };
